@@ -38,7 +38,6 @@ __all__ = ["HFRollout"]
 
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
-        super().__init__()
         self.config = config
         self.module = module
 
@@ -175,3 +174,25 @@ class HFRollout(BaseRollout):
 
         self.module.train()
         return DataProto(batch=batch)
+
+    async def resume(self, tags: list[str]):
+        """Resume rollout weights or kv cache in GPU memory.
+
+        HFRollout shares the actor model directly, so no-op.
+        """
+
+    async def release(self):
+        """Release weights and kv cache in GPU memory.
+
+        HFRollout shares the actor model directly, so no-op.
+        """
+
+    async def update_weights(
+        self,
+        weights,
+        **kwargs,
+    ):
+        """Update the weights of the rollout model.
+
+        HFRollout shares the actor model directly, so weights are already in sync via FSDP.
+        """

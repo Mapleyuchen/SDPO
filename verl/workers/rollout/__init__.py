@@ -16,4 +16,24 @@ from .base import BaseRollout, get_rollout_class
 from .hf_rollout import HFRollout
 from .naive import NaiveRollout
 
-__all__ = ["BaseRollout", "NaiveRollout", "HFRollout", "get_rollout_class"]
+# IsoGraph imports
+from .isograph_env import DummyEnvironment, VE_MDP_Environment, ActionResult, ActionType
+from .action_interceptor import ActionInterceptor, InterceptedTrajectory, TrajectoryStep, InterceptState
+from .isograph_rollout import IsoGraphRollout
+
+__all__ = [
+    "BaseRollout",
+    "NaiveRollout",
+    "HFRollout",
+    "get_rollout_class",
+    # IsoGraph components
+    "DummyEnvironment",
+    "VE_MDP_Environment",
+    "ActionResult",
+    "ActionType",
+    "ActionInterceptor",
+    "InterceptedTrajectory",
+    "TrajectoryStep",
+    "InterceptState",
+    "IsoGraphRollout",
+]

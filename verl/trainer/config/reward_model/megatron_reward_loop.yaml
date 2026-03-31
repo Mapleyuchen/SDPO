@@ -13,7 +13,7 @@ num_workers: 1
 nnodes: 0
 
 model:
-  path: ~/models/FsfairX-LLaMA3-RM-v0.1
+  path: openai-community/gpt2
   external_lib: ${actor_rollout_ref.model.external_lib}
   trust_remote_code: False
 

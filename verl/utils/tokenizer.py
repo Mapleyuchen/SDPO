@@ -34,6 +34,29 @@ def set_pad_token_id(tokenizer):
         warnings.warn(f"tokenizer.pad_token is None. Now set to {tokenizer.eos_token}", stacklevel=1)
 
 
+def _patch_validate_repo_id_for_local():
+    """Patch huggingface_hub's validate_repo_id to accept local filesystem paths.
+
+    This is needed because huggingface_hub >= 0.24 unconditionally validates repo IDs
+    in cached_file/cached_files paths (even when local_files_only=True), rejecting
+    absolute local paths like '/home/user/model'. The function is patched to skip
+    validation when the path actually exists on the local filesystem.
+
+    See: https://github.com/huggingface/huggingface_hub/issues/2004
+    """
+    import os
+    import huggingface_hub.utils._validators as _val_mod
+
+    _original_validate = _val_mod.validate_repo_id
+
+    def _validate_repo_id_patched(repo_id, *args, **kwargs):
+        if isinstance(repo_id, str) and os.path.isdir(repo_id):
+            return  # Local path: skip validation
+        return _original_validate(repo_id, *args, **kwargs)
+
+    _val_mod.validate_repo_id = _validate_repo_id_patched
+
+
 def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kwargs):
     """Create a huggingface pretrained tokenizer which correctness handles eos and pad tokens.
 
@@ -48,16 +71,22 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         transformers.PreTrainedTokenizer: The pretrained tokenizer.
 
     """
+    import os
     from transformers import AutoTokenizer
 
+    # Patch huggingface_hub to accept local paths (see function definition above)
+    _patch_validate_repo_id_for_local()
+
     if correct_gemma2 and isinstance(name_or_path, str) and "gemma-2-2b-it" in name_or_path:
-        # the EOS token in gemma2 is ambiguious, which may worsen RL performance.
-        # https://huggingface.co/google/gemma-2-2b-it/commit/17a01657f5c87135bcdd0ec7abb4b2dece04408a
         warnings.warn(
             "Found gemma-2-2b-it tokenizer. Set eos_token and eos_token_id to <end_of_turn> and 107.", stacklevel=1
         )
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
+
+    if isinstance(name_or_path, str) and os.path.isdir(name_or_path):
+        kwargs["local_files_only"] = True
+
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
@@ -73,7 +102,14 @@ def hf_processor(name_or_path, **kwargs):
     Returns:
         transformers.ProcessorMixin: The pretrained processor.
     """
+    import os
     from transformers import AutoConfig, AutoProcessor
+
+    # Patch huggingface_hub to accept local paths (see function definition above)
+    _patch_validate_repo_id_for_local()
+
+    if isinstance(name_or_path, str) and os.path.isdir(name_or_path):
+        kwargs["local_files_only"] = True
 
     try:
         processor = AutoProcessor.from_pretrained(name_or_path, **kwargs)

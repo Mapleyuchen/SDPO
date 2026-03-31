@@ -26,7 +26,7 @@ model:
 
   # RM’s HDFS path or local path. Note that RM only supports AutoModelForSequenceClassification.
   # Other model types need to define their own RewardModelWorker and pass it from the code.
-  path: ~/models/FsfairX-LLaMA3-RM-v0.1
+  path: openai-community/gpt2
 
   # External model implementation (optional)
   external_lib: ${actor_rollout_ref.model.external_lib}

@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from enum import Enum
 from typing import Any, Optional
 from uuid import uuid4
@@ -38,6 +39,7 @@ from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.environment.dummy_environment import DummyEnvironment
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -129,6 +131,8 @@ class ToolAgentLoop(AgentLoopBase):
             self.interaction_map: dict[str, BaseInteraction] = self._initialize_interactions(
                 self.interaction_config_file
             )
+        # Dummy environment for Action Interceptor (IsoGraph testing)
+        self.dummy_env = DummyEnvironment()
 
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
@@ -252,8 +256,31 @@ class ToolAgentLoop(AgentLoopBase):
         if self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
             return AgentState.TERMINATED
 
-        # Extract tool calls
+        # Extract tool calls via configured parser
         _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids)
+
+        # Detect IsoGraph special action tokens (e.g., <zoom>[x1,y1,x2,y2]</zoom>, <call_svm>)
+        try:
+            decoded_text = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(agent_data.response_ids, skip_special_tokens=False)
+            )
+        except Exception:
+            decoded_text = ""
+
+        # pattern: <zoom>[x1, y1, x2, y2]</zoom>
+        zoom_matches = re.findall(r"<zoom>\s*\[([^\]]+)\]\s*</zoom>", decoded_text)
+        for match in zoom_matches:
+            try:
+                coords = [float(x.strip()) for x in match.split(",") if x.strip()]
+            except Exception:
+                coords = []
+            fc = FunctionCall(name="iso_env", arguments=json.dumps({"action": "zoom", "bbox": coords}))
+            agent_data.tool_calls.append(fc)
+
+        # pattern: <call_svm> (simple token)
+        if "<call_svm>" in decoded_text:
+            fc = FunctionCall(name="iso_env", arguments=json.dumps({"action": "call_svm"}))
+            agent_data.tool_calls.append(fc)
 
         # Handle interaction if needed
         if self.interaction_config_file:
@@ -411,6 +438,21 @@ class ToolAgentLoop(AgentLoopBase):
         self, tool_call: FunctionCall, tools_kwargs: dict[str, Any], agent_data: AgentData
     ) -> tuple[ToolResponse, float, dict]:
         """Call tool and return tool response."""
+        # Action Interceptor: handle IsoGraph environment actions locally
+        if tool_call.name == "iso_env":
+            try:
+                tool_args = json.loads(tool_call.arguments)
+            except Exception:
+                tool_args = tool_call.arguments
+            try:
+                if asyncio.iscoroutinefunction(self.dummy_env.step):
+                    res_text = await self.dummy_env.step(tool_args)
+                else:
+                    res_text = await self.loop.run_in_executor(None, lambda: self.dummy_env.step(tool_args))
+                return ToolResponse(text=res_text), 0.0, {}
+            except Exception as e:
+                logger.warning(f"Error when executing iso_env action: {e}")
+                return ToolResponse(text=f"Error when executing iso_env action: {e}"), 0.0, {}
         tool, instance_id = None, None
         try:
             # TODO: append malformed tool_call to the prompt: invalid function name or arguments

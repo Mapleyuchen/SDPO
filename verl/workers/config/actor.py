@@ -142,18 +142,51 @@ class RouterReplayConfig(BaseConfig):
 
 
 @dataclass
+class PolicyLossIsographConfig(BaseConfig):
+    """Configuration for IsoGraph SDPO algorithm.
+
+    Attributes:
+        ema_decay: EMA decay rate for Self-Teacher model (default: 0.99)
+        beta: KL penalty coefficient against reference model (default: 0.01)
+        clip_ratio: PPO clipping parameter ε (default: 0.2)
+        advantage_norm_eps: Epsilon for advantage normalization (default: 1e-8)
+        normalize_advantage: Whether to normalize advantages (default: True)
+        loss_agg_mode: Loss aggregation mode (default: "token-mean")
+        tau_node: Threshold for node alignment score S_node (default: 0.8)
+        tau_edge: Threshold for edge topology score S_edge (default: 0.7)
+        tau_order: Threshold for reading order score S_order (default: 0.6)
+        lambda_node: Scaling hyperparameter for node score (default: 1.0)
+        lambda_edge: Scaling hyperparameter for edge score (default: 1.0)
+        fgw_alpha: Balance between semantic and topological cost (default: 0.5)
+    """
+    ema_decay: float = 0.99
+    beta: float = 0.01
+    clip_ratio: float = 0.2
+    advantage_norm_eps: float = 1e-8
+    normalize_advantage: bool = True
+    loss_agg_mode: str = "token-mean"
+    tau_node: float = 0.8
+    tau_edge: float = 0.7
+    tau_order: float = 0.6
+    lambda_node: float = 1.0
+    lambda_edge: float = 1.0
+    fgw_alpha: float = 0.5
+
+
+@dataclass
 class PolicyLossConfig(BaseConfig):
     """Configuration for policy loss computation.
 
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'sdpo', 'isograph'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
+        isograph (PolicyLossIsographConfig): Configuration for IsoGraph SDPO algorithm.
     """
 
     loss_mode: str = "vanilla"
@@ -162,6 +195,7 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    isograph: PolicyLossIsographConfig = field(default_factory=PolicyLossIsographConfig)
 
 
 @dataclass

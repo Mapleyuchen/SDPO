@@ -1,0 +1,68 @@
+{
+    "image_id": "hongloumeng_jiaxu_001",
+    "adversarial_scenario": "NOTE_MISANCHORING",
+    "metadata": {"width": 1000, "height": 1000},
+    "oracle_graph": {
+      "nodes": [
+        {
+          "node_id": "n_main1",
+          "polygon": [850, 100, 950, 100, 950, 500, 850, 500],
+          "text": "話說周瑞家的送了劉姥姥去後",
+          "type": "MAIN_TEXT",
+          "attributes": {"group_id": "G_main1", "z_index": 1, "color": "black"}
+        },
+        {
+          "node_id": "n_main2",
+          "polygon": [850, 500, 950, 500, 950, 900, 850, 900],
+          "text": "便上來回王夫人話",
+          "type": "MAIN_TEXT",
+          "attributes": {"group_id": "G_main1", "z_index": 1, "color": "black"}
+        },
+        {
+            "node_id": "n_side1",
+            "polygon": [800, 500, 840, 500, 845, 600, 805, 600],
+            "text": "不回鳳姐",
+            "type": "SIDE_MARGINALIA",
+            "attributes": {"group_id": "G_side1", "z_index": 2, "color": "black"} 
+        },
+        {
+            "node_id": "n_side2",
+            "polygon": [805, 600, 845, 600, 850, 700, 810, 700],
+            "text": "卻回王夫人",
+            "type": "SIDE_MARGINALIA",
+            "attributes": {"group_id": "G_side1", "z_index": 2, "color": "black"}
+        },
+        {
+            "node_id": "n_side3",
+            "polygon": [810, 700, 850, 700, 855, 800, 815, 800],
+            "text": "不交代處",
+            "type": "SIDE_MARGINALIA",
+            "attributes": {"group_id": "G_side1", "z_index": 2, "color": "black"}
+        },
+        {
+            "node_id": "n_side4",
+            "polygon": [815, 800, 855, 800, 860, 900, 820, 900],
+            "text": "正交代得清楚",
+            "type": "SIDE_MARGINALIA",
+            "attributes": {"group_id": "G_side1", "z_index": 2, "color": "black"}
+        },
+        {
+            "node_id": "n_main3",
+            "polygon": [700, 100, 800, 100, 800, 500, 700, 500],
+            "text": "誰知王夫人不在上房",
+            "type": "MAIN_TEXT",
+            "attributes": {"group_id": "G_main2", "z_index": 1, "color": "black"}
+        }
+        ],
+        "edges": [
+            {"source": "n_main1", "target": "n_main2", "type": "READS_AFTER"},
+            {"source": "n_main2", "target": "n_main3", "type": "READS_AFTER"},
+            
+            {"source": "n_side1", "target": "n_side2", "type": "READS_AFTER"},
+            {"source": "n_side2", "target": "n_side3", "type": "READS_AFTER"},
+            {"source": "n_side3", "target": "n_side4", "type": "READS_AFTER"},
+            
+            {"source": "n_side1", "target": "n_main2", "type": "ANNOTATES"} 
+        ]
+    }
+}

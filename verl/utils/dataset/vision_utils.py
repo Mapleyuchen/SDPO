@@ -17,7 +17,22 @@ from typing import Optional
 
 import torch
 from PIL import Image
-from qwen_vl_utils import fetch_image, fetch_video
+
+try:
+    from qwen_vl_utils import fetch_image, fetch_video
+    _HAS_QWEN_VL_UTILS = True
+except ImportError:
+    fetch_image = None
+    fetch_video = None
+    _HAS_QWEN_VL_UTILS = False
+
+
+def _require_qwen_vl_utils(func_name: str):
+    if not _HAS_QWEN_VL_UTILS:
+        raise ImportError(
+            f"{func_name} requires the 'qwen_vl_utils' package. "
+            "Install it with: pip install qwen-vl-utils"
+        )
 
 
 def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Image.Image:
@@ -28,6 +43,7 @@ def process_image(image: dict | Image.Image, image_patch_size: int = 14) -> Imag
         assert "image" not in image, "Cannot have both `bytes` and `image`"
         image["image"] = Image.open(BytesIO(image["bytes"]))
 
+    _require_qwen_vl_utils("process_image")
     return fetch_image(image, image_patch_size=image_patch_size)
 
 
@@ -92,6 +108,7 @@ def process_video(
             if fps_max_frames is not None:
                 video["max_frames"] = fps_max_frames
 
+    _require_qwen_vl_utils("process_video")
     return fetch_video(
         video,
         image_patch_size=image_patch_size,
