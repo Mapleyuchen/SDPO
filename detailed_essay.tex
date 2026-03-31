@@ -1,0 +1,169 @@
+\documentclass{article}
+\usepackage{graphicx} % Required for inserting images
+\usepackage{indentfirst} % 段首缩进
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{bm}
+\usepackage{graphicx} % 引入插入图片所需的宏包
+\usepackage{multirow} % 引入表格所需的宏包
+\usepackage{booktabs} % 引入表格线宏包
+\usepackage{placeins} % 用于FloatBarrier
+\usepackage{flafter} % 图表必须在引用后
+\usepackage{float} % 用于[H]参数
+
+\title{IsoGraph: Self-Distillation Policy Optimization with Rich Feedback for MLLM Structural Hallucinations}
+\author{2350262@tongji.edu.cn}
+\date{March 2026}
+
+\begin{document}
+
+\maketitle
+
+\section{Methodology: The IsoGraph Framework}
+\label{sec:methodology}
+
+Multimodal Large Language Models (MLLMs) have demonstrated remarkable proficiency in semantic comprehension; however, they consistently exhibit severe \textit{structural and relational hallucinations} when confronted with extreme visual environments. Whether navigating the microscopic layout complexities of High Information Density (HID) documents (e.g., ancient manuscripts with interleaved multi-column annotations) or the macroscopic expanses of Ultra-High-Resolution (UHR) imagery, MLLMs struggle to maintain topological coherence under standard passive, single-pass perception paradigms. 
+
+Furthermore, attempting to correct these topological deficits via traditional Reinforcement Learning from Verifiable Rewards (RLVR) typically introduces catastrophic bottlenecks. Compressing multi-dimensional structural failures into a monolithic scalar reward fundamentally obstructs accurate credit assignment. Simultaneously, the standard Proximal Policy Optimization (PPO) chassis relies on auxiliary Critic networks or external Reward Models, introducing unacceptable VRAM overhead and optimization instability during multimodal training.
+
+To intrinsically surmount these foundational bottlenecks, we introduce \textbf{IsoGraph}, a unified, cross-granularity reinforcement learning framework driven by rich semantic feedback. Guided strictly by the principle of Occam's Razor, IsoGraph completely eliminates auxiliary value networks, elegantly bridging the modality gap between mathematical graph verification and MLLM policy optimization. 
+
+The overall architecture of IsoGraph is mathematically formalized and executed through a four-stage pipeline:
+\begin{itemize}
+    \item \textbf{Active Exploration (Section~\ref{subsec:ve-mdp}):} We first redefine passive visual perception as an active \textit{Visual-Evidence Markov Decision Process (VE-MDP)}, equipping the agent with the ability to spatially isolate complex topologies and extract explicit symbolic graphs.
+    \item \textbf{Mathematical Dissection (Section~\ref{subsec:decomposed-verification}):} To resolve the scalar-reward credit assignment failure, we propose a \textit{Decomposed Structural Verification} mechanism. This dissects the Fused Gromov-Wasserstein (FGW) optimal transport problem into orthogonal node alignment, edge topology, and reading-order consistency channels.
+    \item \textbf{Semantic Grounding (Section~\ref{subsec:dgr}):} We introduce a zero-parameter, deterministic mapping function that translates the abstract optimal transport metrics into a natural language \textit{Diagnostic Graph Report (DGR)}, grounding structural errors natively into the model's textual context window.
+    \item \textbf{Gradient Update (Section~\ref{subsec:sdpo}):} Finally, we leverage this rich environmental feedback to perform pure on-policy \textit{Self-Distillation Policy Optimization (SDPO)}. By comparing the blind Student trajectory against the feedback-conditioned Self-Teacher, we derive dense, token-level gradients for structural correction, achieving superior sample efficiency without the overhead of a Critic network.
+\end{itemize}
+
+\begin{figure*}[htbp]
+\centering
+\includegraphics[width=\textwidth]{IsoGraph.png}
+\vspace{-0.8cm} 
+\caption{IsoGraph: Self-Distillation Policy Optimization with Rich Feedback for MLLM Structural Hallucinations}
+\label{fig:layout_paradigm2}
+\end{figure*}
+
+
+\subsection{Visual-Evidence Markov Decision Process (VE-MDP)}
+\label{subsec:ve-mdp}
+
+Current MLLMs fundamentally treat visual reasoning as a passive, single-forward-pass perception task. However, in extreme visual environments, this paradigm inevitably triggers structural hallucinations: in micro-level High Information Density (HID) domains (e.g., ancient documents), passive perception leads to severe attention overload and reading-order inversions; in macro-level Ultra-High-Resolution (UHR) domains (e.g., satellite imagery), it suffers from the Scale-Context Paradox, where zooming in destroys the global topology.
+
+To intrinsically resolve these failure modes, we redefine MLLM inference as an \textbf{Active-Symbolic Evidence Seeking} process. We formalize this interaction not as a standard reinforcement learning environment, but as a novel discrete-time Visual-Evidence Markov Decision Process (VE-MDP). To accommodate our Rich Feedback-Conditioned SDPO (Section~\ref{subsec:sdpo}), we replace the traditional scalar reward function with a semantic feedback distribution, defining the tuple as $\mathcal{M} = \langle \mathcal{S}, \mathcal{A}, \mathcal{T}, \mathcal{E}, \mathcal{F} \rangle$.
+
+\textbf{1. Hierarchical State Space ($\mathcal{S}$):} 
+At any time step $t$, the fully observable state $s_t \in \mathcal{S}$ is constructed as a triplet $s_t = \langle I_{global}, I_{local}^{(t)}, H_{<t} \rangle$. The episode initializes at $s_0 = \langle I_{global}, I_{global}, \emptyset \rangle$.
+\begin{itemize}
+    \item $I_{global}$ represents the down-sampled, overarching macro-topology (the "anchor").
+    \item $I_{local}^{(t)}$ is the high-resolution or attention-isolated local patch at step $t$.
+    \item $H_{<t} = (a_0, e_0, \dots, a_{t-1}, e_{t-1})$ is the historical trajectory, encapsulating all past actions and extracted symbolic evidence to maintain the agent's working memory.
+\end{itemize}
+
+\textbf{2. Action Space ($\mathcal{A}$):} 
+The MLLM acts as an autoregressive agent equipped with a hybrid action space. To ensure compatibility with the LLM's vocabulary, spatial coordinates are normalized and discretized into location tokens:
+\begin{itemize}
+    \item \textit{Navigation ($a_{nav}$):} \texttt{Zoom([x1, y1, x2, y2])} crops the visual context. Crucially, the physical semantics of this action are dual-purpose: in UHR domains, it retrieves missing pixel fidelity; in HID domains, it acts as an explicit \textit{attention isolation mechanism} to filter out dense semantic noise (e.g., masking out irrelevant marginalia to focus on an inline annotation).
+    \item \textit{Symbolic Extraction ($a_{sym}$):} \texttt{Call\_SVM()} invokes a frozen, domain-specific Small Visual Model (e.g., LayoutLM for ancient manuscripts) on the current $I_{local}^{(t)}$.
+    \item \textit{Termination ($a_{term}$):} \texttt{Answer(text)} concludes the visual seeking trajectory and outputs the final structurally-consistent reasoning result.
+\end{itemize}
+
+\textbf{3. Symbolic Evidence ($\mathcal{E}$) \& Transition Function ($\mathcal{T}$):} 
+Unlike conventional MDPs where transitions merely update the pixel state, our transition function $\mathcal{T}: \mathcal{S} \times \mathcal{A} \rightarrow \mathcal{S}$ dynamically routes based on the action type. If $a_{nav}$ is executed, the visual transition deterministically updates $I_{local}^{(t+1)}$ via image cropping. Conversely, the execution of $a_{sym}$ forces the environment to transition into a discrete symbolic space $\mathcal{E}$. The SVM parses the local patch into a domain-agnostic topological graph $e_t = \mathcal{G}_{l}^{(t)} = (\mathcal{V}^l, \mathcal{E}^l) \in \mathcal{E}$, representing visual entities and their logical reading orders. This graph is immediately serialized into text and appended to $H_{<t}$, serving as a hard, hallucination-free structural constraint for the MLLM's subsequent steps.
+
+\textbf{4. Rich Feedback Space ($\mathcal{F}$):} 
+In lieu of a sparse scalar reward $\mathcal{R}:\mathcal{S}\times\mathcal{A}\rightarrow\mathbb{R}$, our VE-MDP concludes an episode by emitting a dense, natural language Diagnostic Graph Report (DGR), denoted as $f \in \mathcal{F}$. The environment computes the Fused Gromov-Wasserstein discrepancy between the agent's accumulated evidence $\bigcup_t \mathcal{G}_l^{(t)}$ and the global oracle graph $\mathcal{G}_g$, mapping the mathematical distortion into a text-based critique. This rich feedback $\mathcal{F}$ is the foundational signal that drives the Self-Distillation Policy Optimization detailed in the subsequent sections.
+
+\subsection{Decomposed Structural Verification via Optimal Transport}
+\label{subsec:decomposed-verification}
+
+A fundamental bottleneck in optimizing active visual agents via Reinforcement Learning from Verifiable Rewards (RLVR) is the severe credit assignment problem. In previous frameworks, structural misalignment between a generated local graph $\mathcal{G}_l = (\mathcal{V}^l, \mathcal{E}^l)$ and the global oracle graph $\mathcal{G}_g = (\mathcal{V}^g, \mathcal{E}^g)$ is typically compressed into a monolithic scalar reward. This sparsity prevents the MLLM from distinguishing whether the failure originated from object misrecognition, relational misplacement, or reading-order inversion.
+
+To decouple this entangled failure mode and provide fine-grained, deterministic verification, we formalize the structural alignment as a Fused Gromov-Wasserstein (FGW) optimal transport problem. Let $\mu_l$ and $\mu_g$ be the empirical uniform distributions over the nodes of $\mathcal{G}_l$ and $\mathcal{G}_g$. We first solve for the unique, globally optimal joint transport plan $\mathbf{T}^* \in \Pi(\mu_l, \mu_g)$ that minimizes the fused semantic and topological costs:
+\begin{equation}
+    \mathbf{T}^* = \mathop{\arg\min}_{\mathbf{T} \in \Pi(\mu_l, \mu_g)} (1-\alpha)\sum_{i,j} \mathbf{C}_{ij} T_{ij} + \alpha \sum_{i,j,i',j'} \left| \mathbf{A}^l_{ii'} - \mathbf{A}^g_{jj'} \right|^2 T_{ij} T_{i'j'}
+\end{equation}
+where $\mathbf{C} \in \mathbb{R}^{|\mathcal{V}^l| \times |\mathcal{V}^g|}$ is the semantic cost matrix (fusing bounding-box IoU and class consistency), $\mathbf{A}$ represents the adjacency matrices, and $\alpha \in [0,1]$ balances the trade-off. Once $\mathbf{T}^*$ is derived, we decompose the verification into three orthogonal, error-type-aligned channels explicitly anchored by $\mathbf{T}^*$.
+
+\textbf{1. Node Alignment Score ($S_{node}$):} 
+This channel isolates \textit{object-level hallucinations}. By fixing the optimal transport plan $\mathbf{T}^*$, we extract the pure semantic displacement component. The score is inverted from the optimal Wasserstein-like distance:
+\begin{equation}
+    S_{node} = \exp\left( - \lambda_n \sum_{i,j} \mathbf{C}_{ij} T^*_{ij} \right)
+\end{equation}
+where $\lambda_n$ is a scaling hyperparameter.
+
+\textbf{2. Edge Topology Score ($S_{edge}$):} 
+This channel strictly captures \textit{spatial and relational distortions}. Driven by the same $\mathbf{T}^*$, we quantify the purely structural distortion component of the Gromov-Wasserstein distance:
+\begin{equation}
+    S_{edge} = \exp\left( - \lambda_e \sum_{i,j,i',j'} \left| \mathbf{A}^l_{ii'} - \mathbf{A}^g_{jj'} \right|^2 T^*_{ij} T^*_{i'j'} \right)
+\end{equation}
+If the agent incorrectly links an inline annotation directly to a distant marginalia, $\mathbf{A}^l$ structurally diverges from $\mathbf{A}^g$, triggering a severe penalty mapped directly through the matched nodes in $T^*_{ij}$ and $T^*_{i'j'}$.
+
+\textbf{3. Reading Order Consistency ($S_{order}$):} 
+Topological presence does not guarantee sequential correctness—a critical failure mode in non-linear reading scenarios (e.g., double-line annotations). Using the non-zero assignments in $\mathbf{T}^*$, we extract $N$ successfully matched node pairs. We project their directed traversal sequences to obtain aligned rank vectors $\mathbf{r}^l$ and $\mathbf{r}^g$. The sequential consistency is then verified using the Kendall rank correlation coefficient ($\tau$):
+\begin{equation}
+    S_{order} = \max \left( 0, \frac{2}{N(N-1)} \sum_{i<j} \text{sgn}(\mathbf{r}^l_i - \mathbf{r}^l_j) \text{sgn}(\mathbf{r}^g_i - \mathbf{r}^g_j) \right)
+\end{equation}
+We apply a ReLU-like truncation to strictly zero out negative correlations, ensuring the feedback remains a constructive verification signal.
+
+By explicitly decoupling the topology verification using the shared optimal transport plan $\mathbf{T}^*$, the environment escapes the scalar-reward bottleneck. These deterministic metrics $S_{node}$, $S_{edge}$, and $S_{order}$ natively act as the structured variables required to generate the Rich Feedback (DGR) for the Self-Distillation Policy Optimization.
+
+\subsection{Semantic Grounding via Diagnostic Graph Report (DGR)}
+\label{subsec:dgr}
+
+A fundamental limitation of traditional Reinforcement Learning from Verifiable Rewards (RLVR) in MLLMs is the intrinsic modality gap between the mathematical verification space and the model's semantic understanding. Compressing the multi-dimensional structural discrepancies---specifically, $S_{node}$, $S_{edge}$, and $S_{order}$ computed in Section~\ref{subsec:decomposed-verification}---into a monolithic scalar reward fundamentally deprives the MLLM of actionable correction signals. The agent learns that it failed, but remains oblivious to the topological root cause.
+
+Following the principle of Occam's Razor, we bypass the need for auxiliary natural language reward models. Instead, we propose a zero-parameter, deterministic mapping function $\Phi$ that translates the optimal transport evaluations into a rich, natural language prompt, which we term the \textbf{Diagnostic Graph Report (DGR)}.
+
+Formally, the environment acts as a symbolic-to-semantic translator:
+\begin{equation}
+    f_{DGR} = \Phi\Big(\mathcal{G}_l, \mathcal{G}_g, \mathbf{T}^*, \{S_{node}, S_{edge}, S_{order}\}\Big)
+\end{equation}
+where $f_{DGR} \in \mathcal{F}$ belongs to the rich feedback space defined in our VE-MDP. Crucially, explicitly conditioning on the optimal joint transport plan $\mathbf{T}^*$ allows $\Phi$ to deterministically trace global topological errors back to specific local node instances. The function $\Phi$ triggers specific linguistic critique templates based on empirically defined mathematical thresholds ($\tau_n, \tau_e, \tau_o$):
+
+\begin{itemize}
+    \item \textbf{Semantic Entity Critique ($S_{node} < \tau_n$):} If the Wasserstein distance indicates severe bounding-box or class mismatch, the DGR explicitly lists the hallucinated or omitted visual entities.
+    \item \textbf{Spatial Topology Critique ($S_{edge} < \tau_e$):} If the Gromov-Wasserstein structural distortion is high, the environment queries the misaligned assignments in $\mathbf{T}^*$ to isolate the exact erroneous edges. The text explicitly guides the model (e.g., pointing out that an annotation should be a child of a specific main-text column).
+    \item \textbf{Sequential Logic Critique ($S_{order} < \tau_o$):} If the Kendall rank correlation $\tau$ drops, the DGR highlights the inverted sub-sequences, which is particularly critical for recovering non-linear reading orders in double-line annotations.
+\end{itemize}
+
+\textbf{Example of DGR Generation:} Consider a High Information Density (HID) scenario where the MLLM correctly identifies all characters but sequentially flattens a multi-column annotation, destroying the hierarchical layout. The traditional scalar reward would merely return $r = 0.3$. In contrast, our environment evaluates the decoupled metrics, queries $\mathbf{T}^*$, and constructs the following DGR context:
+
+\begin{quote}
+    \textit{[System Diagnostic]: Semantic alignment is perfect ($S_{node} = 1.0$), but spatial topology is distorted ($S_{edge} = 0.25$). Structural Error: You incorrectly connected the main text node `N\_001` to all subsequent annotations linearly. The layout dictates a parallel branching topology. Consequently, the reading order is inverted (Kendall $\tau = 0.40$). Please reconstruct the logical edges based on this spatial feedback.}
+\end{quote}
+
+This dynamically generated DGR explicitly grounds the abstract graph-matching calculus into an actionable linguistic space. By embedding $f_{DGR}$ into the MLLM's context window, we seamlessly prepare the architectural foundation for the Self-Distillation Policy Optimization, enabling the model to learn directly from explicit structural reasoning rather than blind trial-and-error.
+
+\subsection{Rich Feedback-Conditioned Self-Distillation Policy Optimization (SDPO)}
+\label{subsec:sdpo}
+
+Standard Reinforcement Learning from Verifiable Rewards (RLVR) typically relies on Proximal Policy Optimization (PPO). However, PPO necessitates learning an auxiliary Value network $\mathcal{V}_\phi(s)$ to compute the Generalized Advantage Estimation (GAE). In multimodal structural reasoning, mapping a highly complex visual topology to a single scalar value is notoriously unstable, leading to severe variance and optimization collapse. 
+
+Adhering to the principle of Occam's Razor, we eliminate the Critic network entirely. Instead, we propose a pure on-policy Self-Distillation Policy Optimization (SDPO) that directly leverages the Diagnostic Graph Report ($f_{DGR}$) generated in Section~\ref{subsec:dgr}. Our framework forces a single MLLM to dynamically switch between two cognitive roles: an explorative \textit{Student} and a retrospective \textit{Self-Teacher}.
+
+\textbf{1. Dual-Role Forward Pass:} 
+During the rollout phase, the \textbf{Student} generates a structural reasoning trajectory $y = (a_1, \dots, a_T)$ conditioned strictly on the visual state and historical context, without knowing its correctness. The probability of generating action $a_t$ is defined as $\pi_\theta(a_t \mid s_t, y_{<t})$.
+Once the trajectory is completed and evaluated by the environment, the \textbf{Self-Teacher} receives the identical state augmented with the rich textual feedback $f_{DGR}$. The Self-Teacher re-evaluates the same trajectory $y$ using a feedback-conditioned forward pass, yielding the informed probability $\pi_{\theta'}(a_t \mid s_t, y_{<t}, f_{DGR})$, where $\theta'$ represents an Exponential Moving Average (EMA) of the model weights to maintain teacher stability.
+
+\textbf{2. Fine-grained Advantage Estimation:} 
+Rather than relying on sparse episodic returns, we formulate a dense, token-level advantage $\hat{A}_t$ by computing the log-probability discrepancy between the Teacher and the Student. To ensure training stability, gradients do not flow through the Teacher policy:
+\begin{equation}
+    \hat{A}_t = \text{stop\_gradient}\Big( \log \pi_{\theta'}(a_t \mid s_t, y_{<t}, f_{DGR}) \Big) - \log \pi_\theta(a_t \mid s_t, y_{<t})
+\end{equation}
+\textit{Mechanism:} This formulation mathematically solves the credit assignment problem. If the Student hallucinates a topological edge, the environment's $f_{DGR}$ explicitly diagnoses this error. Consequently, the Self-Teacher will assign a drastically lower probability to that specific hallucinated action compared to the blind Student, resulting in a negative advantage ($\hat{A}_t < 0$). Conversely, structurally sound actions verified by the DGR receive positive reinforcement. In practice, $\hat{A}_t$ is normalized across the mini-batch before optimization.
+
+\textbf{3. SDPO Objective:} 
+We update the policy $\pi_\theta$ by maximizing this rich-feedback advantage using a clipped surrogate objective to prevent destructively large policy updates. Crucially, we integrate a per-token Kullback-Leibler (KL) penalty against the frozen pre-trained model $\pi_{ref}$ directly into the time-step summation to prevent semantic drift:
+\begin{equation}
+\begin{aligned}
+    \mathcal{L}^{actor}(\theta) &= \mathbb{E}_{y \sim \pi_{\theta_{old}}} \Bigg[ \sum_{t=1}^T \Bigg( \min \Big( \rho_t(\theta) \hat{A}_t, \, \text{clip}\big(\rho_t(\theta), 1-\epsilon, 1+\epsilon\big) \hat{A}_t \Big) \\
+    &\quad\quad\quad\quad\quad - \beta \log \frac{\pi_\theta(a_t \mid s_t, y_{<t})}{\pi_{ref}(a_t \mid s_t, y_{<t})} \Bigg) \Bigg]
+\end{aligned}
+\end{equation}
+where $\rho_t(\theta) = \frac{\pi_\theta(a_t \mid s_t, y_{<t})}{\pi_{\theta_{old}}(a_t \mid s_t, y_{<t})}$ is the importance sampling ratio, and $\beta$ controls the KL regularization strength.
+
+By compressing the complex optimal transport verification into a textual prompt, and extracting the policy gradient directly via self-distillation, \textbf{IsoGraph} achieves dense, token-level structural correction while reducing the VRAM footprint of traditional RLVR by 50\%.
+
+
+\end{document}
