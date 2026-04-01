@@ -56,20 +56,31 @@ max_model_len: 8192
 actor_rollout_ref:
 
   actor:
-    
+
+    # --------------------------------------------------------------------------
+    # FSDP / memory offload configuration
+    # --------------------------------------------------------------------------
     fsdp_config:
 
-      # Parameter offloading to CPU to save GPU memory (important for large models)
+      # Offload model parameters to CPU when not needed (saves GPU memory)
       param_offload: true
 
-      # Don't offload optimizer state (keep on GPU for faster updates)
+      # Offload optimizer states to CPU (saves ~28GB for 7B model with AdamW)
       optimizer_offload: true
-    
+
     # --------------------------------------------------------------------------
     # Batch size configuration
     # --------------------------------------------------------------------------
     # Use dynamic batch sizing for flexible memory management
     use_dynamic_bsz: true
+
+    # --------------------------------------------------------------------------
+    # KL penalty configuration (required for IsoGraph SDPO token-level KL)
+    # --------------------------------------------------------------------------
+    # Enable KL penalty against reference model.
+    # This makes ref_log_prob available in dp_actor micro-batch,
+    # which is used by compute_policy_loss_isograph for token-level KL penalty.
+    use_kl_loss: true
 
     # Maximum tokens per GPU per micro batch (for dynamic batching)
     ppo_max_token_len_per_gpu: 4096
@@ -200,6 +211,9 @@ actor_rollout_ref:
   # Rollout configuration
   # --------------------------------------------------------------------------
   rollout:
+
+    # Use IsoGraphRollout for interactive env feedback when loss_mode=isograph
+    use_isograph_rollout: true
 
     # Number of rollouts per update (n in the paper)
     # Higher n = more data per update = better gradient estimate

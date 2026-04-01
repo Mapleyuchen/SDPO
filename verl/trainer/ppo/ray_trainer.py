@@ -216,6 +216,13 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
+    # Check for IsoGraph pre-computed advantages (from IsoGraphRayPPOTrainer).
+    # If already computed, skip GRPO/GAE and use the token-level IsoGraph advantages
+    # A_t = log π_teacher - log π_student instead of reward-based advantages.
+    if "isograph_advantages_computed" in data.batch:
+        if data.batch["isograph_advantages_computed"].item() and "isograph_advantages" in data.batch:
+            data.batch["advantages"] = data.batch["isograph_advantages"]
+            return data
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)

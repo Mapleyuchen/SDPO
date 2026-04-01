@@ -34,8 +34,10 @@ from tensordict import TensorDict
 from torch import nn
 
 from verl import DataProto
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.torch_functional import get_response_mask
+from verl.workers.config import HFModelConfig
 
 from .base import BaseRollout
 from .action_interceptor import ActionInterceptor, InterceptedTrajectory
@@ -97,22 +99,35 @@ class IsoGraphRollout(BaseRollout):
     """
     
     def __init__(
-        self, 
-        module: nn.Module, 
+        self,
+        module: nn.Module,
         config: Any,
-        tokenizer: Any,
+        tokenizer: Any = None,
+        model_config: Any = None,
+        device_mesh: Any = None,
         environment: Optional[DummyEnvironment] = None,
     ):
         """
         Initialize IsoGraph Rollout.
-        
+
         Args:
             module: The MLLM module (must support HF-style forward)
-            config: Configuration object with rollout settings
-            tokenizer: HuggingFace tokenizer for tokenization
+            config: Configuration object with rollout settings (RolloutConfig or dict)
+            tokenizer: HuggingFace tokenizer for tokenization (optional; lazy-loads from module if None)
+            model_config: HFModelConfig (optional, for BaseRollout compatibility)
+            device_mesh: DeviceMesh (optional, for BaseRollout compatibility)
             environment: Environment for action execution (DummyEnvironment or VE-MDP)
         """
-        super().__init__(module, config)
+        # Store attributes directly instead of calling BaseRollout.__init__
+        # (BaseRollout.__init__ requires config/model_config/device_mesh but
+        # HFRollout also bypasses it, so we follow the same pattern.)
+        self.config = omega_conf_to_dataclass(config)
+        self.model_config: HFModelConfig = (
+            omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
+            if model_config is not None else None
+        )
+        self.device_mesh = device_mesh
+        self.module = module
         self.tokenizer = tokenizer
         
         # Create environment if not provided
@@ -281,54 +296,71 @@ class IsoGraphRollout(BaseRollout):
         full_sequences = torch.stack(padded_sequences)  # (batch_size, max_seq_len)
         full_masks = torch.stack(padded_masks)
         full_positions = torch.stack(padded_positions)
-        
-        # Get response portion and log probs
-        responses = full_sequences[:, :prompt_length]  # This is actually wrong, need to fix
-        # Actually, the response is everything after the prompt
-        # But since sequences have variable lengths due to env feedback,
-        # we need to handle this differently
-        
-        # For now, let's compute responses differently
-        # The response starts at prompt_length and goes to end
-        # But different samples may have different lengths
-        # Let's compute per-sample response masks
-        response_masks = []
-        for i, seq in enumerate(all_sequences):
+
+        # Compute response_length from the first sample's sequence.
+        # Since env feedback makes lengths variable, we use the max_seq_len
+        # and treat everything after prompt_length as the response.
+        response_length = max_seq_len - prompt_length  # may be 0 for some samples
+
+        # Extract response-only portion for each sample, padded to same response_length
+        padded_responses = []
+        for seq in all_sequences:
             seq_len = seq.size(0)
-            if seq_len > prompt_length:
-                # Response is from prompt_length to seq_len
-                mask = torch.zeros(max_seq_len, device=seq.device)
-                mask[prompt_length:seq_len] = 1
+            resp = seq[prompt_length:]  # response portion (may be shorter than response_length)
+            pad_len = response_length - resp.size(0)
+            if pad_len > 0:
+                resp = torch.cat([resp, torch.full((pad_len,), pad_token_id, device=resp.device, dtype=resp.dtype)])
+            padded_responses.append(resp)
+        full_responses = torch.stack(padded_responses)  # (batch_size, response_length)
+
+        # Extend attention_mask: original prompt mask + response mask (1 for each response token)
+        # This matches hf_rollout's convention: response_mask is embedded in attention_mask
+        padded_response_masks = []
+        for i in range(batch_size):
+            seq = all_sequences[i]
+            seq_len = seq.size(0)
+            resp_mask = torch.ones(response_length, device=seq.device, dtype=full_masks.dtype)
+            if seq_len < max_seq_len:
+                # This sample is shorter than max_seq_len: pad attention mask too
+                extra_pad = max_seq_len - seq_len
+                extra_resp_pad = max(0, response_length - (seq_len - prompt_length))
+                attn_pad = torch.zeros(extra_pad, device=seq.device, dtype=full_masks.dtype)
             else:
-                mask = torch.zeros(max_seq_len, device=seq.device)
-            response_masks.append(mask)
-        
-        full_response_mask = torch.stack(response_masks)  # (batch_size, max_seq_len)
-        
-        # Get response log probs (padded)
-        max_response_len = max(lp.size(0) for lp in all_log_probs)
+                attn_pad = None
+            padded_response_masks.append(resp_mask)
+        full_response_masks = torch.stack(padded_response_masks)  # (batch_size, response_length)
+
+        # Get response log probs (already computed per sample, pad to response_length)
         padded_log_probs = []
         for lp in all_log_probs:
             lp_len = lp.size(0)
-            padding_len = max_response_len - lp_len
-            if padding_len > 0:
-                pad_lp = torch.zeros(padding_len, device=lp.device, dtype=lp.dtype)
-                padded_lp = torch.cat([lp, pad_lp])
-            else:
-                padded_lp = lp
-            padded_log_probs.append(padded_lp)
-        
-        full_log_probs = torch.stack(padded_log_probs)  # (batch_size, max_response_len)
-        
-        # Prepare batch output
+            pad_len = response_length - lp_len
+            if pad_len > 0:
+                lp = torch.cat([lp, torch.zeros(pad_len, device=lp.device, dtype=lp.dtype)])
+            padded_log_probs.append(lp)
+        full_log_probs = torch.stack(padded_log_probs)  # (batch_size, response_length)
+
+        # Build response_mask: [batch, max_seq_len] with 1 for response tokens, 0 for prompt/padding.
+        # This is used by _build_isograph_teacher_batch to identify the response portion.
+        full_response_mask = torch.zeros((batch_size, max_seq_len), device=full_sequences.device, dtype=torch.long)
+        for i, seq in enumerate(all_sequences):
+            seq_len = seq.size(0)
+            if seq_len > prompt_length:
+                full_response_mask[i, prompt_length:seq_len] = 1
+
+        # Prepare batch output.
+        # NOTE: We do set "response_mask" because _build_isograph_teacher_batch needs it
+        # to identify the response region in the teacher input sequence.
         batch = TensorDict(
             {
-                "input_ids": full_sequences,
-                "responses": full_sequences,  # Will be sliced correctly by downstream
-                "sequences": full_sequences,
-                "old_log_probs": full_log_probs,  # Log probs for response tokens
-                "attention_mask": full_masks,
-                "position_ids": full_positions,
+                "prompts": idx,                         # (batch, prompt_length)
+                "input_ids": full_sequences,             # (batch, max_seq_len) full seq
+                "responses": full_responses,             # (batch, response_length) response-only
+                "sequences": full_sequences,            # alias for full seq
+                "old_log_probs": full_log_probs,         # (batch, response_length)
+                "attention_mask": full_masks,            # (batch, max_seq_len)
+                "position_ids": full_positions,          # (batch, max_seq_len)
+                "response_mask": full_response_mask,     # (batch, max_seq_len) 1 for response
                 "num_env_interactions": torch.tensor(all_num_interactions, device=full_sequences.device),
             },
             batch_size=batch_size,

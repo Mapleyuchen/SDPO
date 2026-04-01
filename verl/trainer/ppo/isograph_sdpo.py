@@ -1216,75 +1216,133 @@ def compute_policy_loss_isograph(
     loss_agg_mode: str = "token-mean",
     config: Optional[Any] = None,
     rollout_is_weights: Optional[Tensor] = None,
+    teacher_log_probs: Optional[Tensor] = None,
+    ref_log_probs: Optional[Tensor] = None,
     **kwargs,
 ) -> Tuple[Tensor, Dict[str, Any]]:
     """
-    Register IsoGraph SDPO as a verl policy loss function.
-    
-    This allows seamless integration with the verl training framework.
-    
+    IsoGraph SDPO policy loss — integrated with verl's dp_actor.
+
+    This is the verl PolicyLossFn registered as "isograph". It is called from
+    dp_actor.update_policy() inside the micro-batch loop, where:
+      - student forward pass (log_prob) has already been computed by dp_actor
+      - teacher forward pass (teacher_log_probs) is computed in the isograph
+        branch of dp_actor before calling this function
+      - advantages contain the GRPO reward-based advantages (used as placeholder)
+
+    The CORRECT IsoGraph SDPO objective uses token-level teacher-student advantage:
+      A_t = log π_teacher - log π_student   (not the GRPO reward-based advantage!)
+
+    Full loss:
+      L = Σ_t min(ρ_t · A_t, clip(ρ_t) · A_t) - β · KL(π_θ || π_ref)
+
+    where:
+      - ρ_t = π_θ(a_t) / π_θ_old(a_t)    (importance-sampling ratio)
+      - A_t  = teacher_log_prob - student_log_prob  (token-level SDPO advantage)
+      - β    = config.isograph.beta            (KL penalty coefficient)
+
     Args:
-        old_log_prob: Log probs from rollout policy [batch, seq_len]
-        log_prob: Log probs from current policy [batch, seq_len]
-        advantages: Pre-computed advantages [batch, seq_len]
+        old_log_prob: π_θ_old from rollout [batch, seq_len]
+        log_prob: π_θ current policy [batch, seq_len]
+        advantages: GRPO reward-based advantages (overridden by A_t below)
         response_mask: Valid token mask [batch, seq_len]
         loss_agg_mode: Loss aggregation mode
-        config: Actor config (should contain IsoGraphSDPOConfig)
-        rollout_is_weights: Optional IS weights
-    
+        config: Actor config (must contain isograph sub-config)
+        rollout_is_weights: Optional IS reweighting
+        teacher_log_probs: π_teacher from dual-role forward (REQUIRED for isograph)
+                           These are computed by dp_actor with DGR-prompted teacher inputs.
+        ref_log_probs: π_ref for KL penalty [batch, seq_len] (requires use_kl_loss=True)
+
     Returns:
         Tuple of (loss, metrics)
     """
-    if config is None:
-        # Default config
-        config = IsoGraphSDPOConfig()
-    
-    # Extract IsoGraph config from actor config if present
-    if hasattr(config, "isograph"):
+    # Extract IsoGraph config
+    if config is not None and hasattr(config, "isograph"):
         iso_config = config.isograph
     else:
         iso_config = IsoGraphSDPOConfig(
-            clip_ratio=getattr(config, "clip_ratio", 0.2),
-            beta=getattr(config, "beta", 0.01),
-            ema_decay=getattr(config, "ema_decay", 0.99),
+            clip_ratio=getattr(config, "clip_ratio", 0.2) if config else 0.2,
+            beta=getattr(config, "beta", 0.01) if config else 0.01,
+            ema_decay=getattr(config, "ema_decay", 0.99) if config else 0.99,
             loss_agg_mode=loss_agg_mode,
         )
-    
+
     metrics = {}
-    
-    # IS ratio: ρ_t = π_θ / π_θ_old
+
+    # Compute the CORRECT IsoGraph token-level advantage:
+    #   A_t = log π_teacher(a_t) - log π_student(a_t)
+    # This is the core SDPO advantage from the dual-role forward pass.
+    # If teacher_log_probs is None (shouldn't happen for isograph), fall back to 0.
+    if teacher_log_probs is not None:
+        sdpo_advantages = teacher_log_probs - log_prob  # [batch, seq_len]
+    else:
+        # Degenerate case: teacher not available, use zero advantage
+        sdpo_advantages = torch.zeros_like(log_prob)
+        metrics["isograph/teacher_missing_warning"] = 1.0
+
+    # Normalize token-level advantages for training stability
+    if iso_config.normalize_advantage:
+        valid_mask = response_mask.bool()
+        if valid_mask.sum() > 1:
+            mean = sdpo_advantages[valid_mask].mean()
+            std = sdpo_advantages[valid_mask].std().clamp(min=iso_config.advantage_norm_eps)
+            sdpo_advantages = (sdpo_advantages - mean) / std
+            metrics["isograph/adv_norm_mean"] = mean.item()
+            metrics["isograph/adv_norm_std"] = std.item()
+
+    # Importance-Sampling ratio: ρ_t = π_θ / π_θ_old
     negative_approx_kl = log_prob - old_log_prob
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
-    
-    # KL monitoring
+
+    # KL monitoring (π_θ vs π_θ_old)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
     metrics["actor/ppo_kl"] = ppo_kl.item()
-    
-    # Clipped surrogate
+
+    # PPO clipped surrogate with IsoGraph token-level advantages (A_t)
     clip_low = 1 - iso_config.clip_ratio
     clip_high = 1 + iso_config.clip_ratio
-    
-    pg_losses1 = -advantages * ratio
-    pg_losses2 = -advantages * torch.clamp(ratio, clip_low, clip_high)
+
+    pg_losses1 = -sdpo_advantages * ratio
+    pg_losses2 = -sdpo_advantages * torch.clamp(ratio, clip_low, clip_high)
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
-    
+
     # Clipping statistics
-    pg_clipfrac = verl_F.masked_mean((ratio != torch.clamp(ratio, clip_low, clip_high)).float(), response_mask)
+    pg_clipfrac = verl_F.masked_mean(
+        (ratio != torch.clamp(ratio, clip_low, clip_high)).float(), response_mask
+    )
     metrics["actor/pg_clipfrac"] = pg_clipfrac.item()
-    
-    # Apply IS weights if provided
+
+    # Token-level KL penalty against reference model
+    # -β · KL(π_θ || π_ref) = -β · (log π_θ - log π_ref)
+    if ref_log_probs is not None:
+        ref_kl = log_prob - ref_log_probs
+        ref_kl = torch.clamp(ref_kl, min=-20.0, max=20.0)
+        kl_penalty_per_token = iso_config.beta * ref_kl
+        metrics["isograph/ref_kl"] = verl_F.masked_mean(ref_kl, response_mask).item()
+        total_losses = pg_losses - kl_penalty_per_token
+    else:
+        metrics["isograph/ref_kl"] = 0.0
+        total_losses = pg_losses
+
+    # Apply IS reweighting if provided
     if rollout_is_weights is not None:
-        pg_losses = pg_losses * rollout_is_weights
-    
+        total_losses = total_losses * rollout_is_weights
+
     # Aggregate loss
     loss = agg_loss(
-        loss_mat=pg_losses,
+        loss_mat=total_losses,
         loss_mask=response_mask,
         loss_agg_mode=loss_agg_mode,
         batch_num_tokens=response_mask.sum().clamp(min=1.0),
     )
-    
+
+    # Metrics
+    metrics["isograph/sdpo_adv_mean"] = verl_F.masked_mean(sdpo_advantages, response_mask).item()
+    valid_sdpo_adv = sdpo_advantages[response_mask.bool()]
+    metrics["isograph/sdpo_adv_std"] = valid_sdpo_adv.std().item() if valid_sdpo_adv.numel() > 1 else 1.0
+    metrics["isograph/loss"] = loss.item()
+
     return loss, metrics
 
 

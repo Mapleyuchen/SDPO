@@ -235,10 +235,23 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 batch = batch.union(self_distillation_batch)
                 metrics.update(self_dist_metrics)
             # ...
-            batch = compute_advantage(batch, ...)      ← overwritten below
+            batch = compute_advantage(batch, ...)    ← checks isograph_advantages_computed; skips GRPO
             # ...
-            actor_output = self._update_actor(batch)  ← uses IsoGraph advantages
+            actor_output = self._update_actor(batch)  ← dp_actor uses teacher forward + IsoGraph loss
         """
+        # ------------------------------------------------------------------
+        # Defensive checks: fail fast if config is wrong
+        # ------------------------------------------------------------------
+        use_kl_loss = self.config.actor_rollout_ref.actor.get("use_kl_loss", False)
+        if not use_kl_loss:
+            raise ValueError(
+                f"[IsoGraph] FATAL: use_kl_loss is False. "
+                f"IsoGraph SDPO requires use_kl_loss=True so that ref_log_prob "
+                f"is available in dp_actor's micro-batch for the token-level "
+                f"KL penalty: L = ... - β·KL(π_θ || π_ref). "
+                f"Please set: actor_rollout_ref.actor.use_kl_loss=true"
+            )
+
         # ------------------------------------------------------------------
         # STEP A: Call parent's self-distillation logic (standard reprompt)
         # This gives us the standard teacher batch with solution context.
@@ -273,6 +286,19 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
             all_metrics.update({k: v for k, v in parent_metrics.items()
                                if k not in all_metrics})
 
+        # =====================================================================
+        # CRITICAL: Inject IsoGraph advantages DIRECTLY into batch.batch["advantages"]
+        # so they are used by dp_actor.update_policy instead of GRPO advantages.
+        # This must happen AFTER _compute_isograph_advantages stores them.
+        # The ray_trainer.fit() calls compute_advantage() AFTER this method,
+        # but since we inject advantages here (BEFORE that call), the injection
+        # takes precedence. This is the correct fix for the dead-code problem
+        # where the local compute_advantage override in this file was never called.
+        # =====================================================================
+        if "isograph_advantages" in batch.batch:
+            batch.batch["advantages"] = batch.batch["isograph_advantages"]
+            all_metrics["isograph/advantages_injected"] = True
+
         if sd_batch is not None:
             return sd_batch, all_metrics
         elif parent_result is not None:
@@ -295,10 +321,15 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         """
         metrics = {}
 
-        # Only compute if loss_mode is isograph
+        # Defensive check: IsoGraph advantages are REQUIRED for IsoGraph SDPO.
+        # Raise immediately if the config is wrong, rather than silently computing wrong advantages.
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if loss_mode != "isograph":
-            return metrics
+            raise ValueError(
+                f"[IsoGraph] FATAL: loss_mode is '{loss_mode}' but IsoGraphRayPPOTrainer "
+                f"is active. IsoGraph SDPO requires loss_mode='isograph'. "
+                f"Please check your config: actor_rollout_ref.actor.policy_loss.loss_mode=isograph"
+            )
 
         try:
             # ------------------------------------------------------------------
@@ -363,30 +394,17 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 # For now, teacher = student (EMA is updated in _update_actor)
                 teacher_log_probs = student_log_probs.detach()  # proxy: same as student
 
-                # ------------------------------------------------------------------
-                # Compute IsoGraph advantage: A_t = log(π_teacher) - log(π_student)
-                # ------------------------------------------------------------------
-                advantages, adv_metrics = compute_isograph_advantage(
-                    teacher_log_probs=teacher_log_probs,
-                    student_log_probs=student_log_probs,
-                    response_mask=response_mask,
-                    normalize=self.isograph_config.normalize_advantage,
-                    eps=self.isograph_config.advantage_norm_eps,
-                )
-
             # ------------------------------------------------------------------
-            # Store IsoGraph advantages in batch so compute_advantage() can skip
-            # We mark them so the downstream code knows these are pre-computed
+            # Store a marker so ray_trainer.compute_advantage() skips GRPO
+            # computation. The ACTUAL IsoGraph advantage A_t = teacher - student
+            # is computed INSIDE compute_policy_loss_isograph from the real
+            # teacher_log_probs (from dp_actor's dual-role forward pass), not
+            # from the proxy here. Storing zero here is harmless since it will
+            # be overwritten by compute_policy_loss_isograph.
             # ------------------------------------------------------------------
-            batch.batch["isograph_advantages"] = advantages
+            if "isograph_advantages" not in batch.batch:
+                batch.batch["isograph_advantages"] = torch.zeros_like(student_log_probs)
             batch.batch["isograph_advantages_computed"] = torch.tensor(True, device=device)
-
-            metrics["isograph/adv_mean"] = adv_metrics.get("isograph/raw_adv_mean", 0.0)
-            metrics["isograph/adv_std"] = adv_metrics.get("isograph/raw_adv_std", 1.0)
-            metrics["isograph/norm_adv_mean"] = adv_metrics.get("isograph/norm_adv_mean", 0.0)
-            metrics["isograph/norm_adv_std"] = adv_metrics.get("isograph/norm_adv_std", 1.0)
-            metrics["isograph/adv_pos_ratio"] = adv_metrics.get("isograph/adv_pos_ratio", 0.0)
-            metrics["isograph/teacher_update_count"] = self.teacher_update_count
 
         except Exception as e:
             metrics["isograph/adv_error"] = str(e)
@@ -441,12 +459,20 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         """
         Build the self-distillation teacher batch for IsoGraph SDPO.
 
-        This augments the standard verl self-distillation batch with DGR
-        context for the Self-Teacher's feedback-conditioned forward pass.
+        This builds per-sample DGR-prompted teacher inputs.
 
-        In the paper:
-          - Student: π_θ(a_t|s_t, y_{<t})  ← original prompt
-          - Self-Teacher: π_θ'(a_t|s_t, y_{<t}, f_DGR)  ← reprompted with DGR
+        Teacher input structure: [DGR_prompt | response]  (same response tokens as student)
+        Teacher attention mask: [1s for DGR_prompt | response_mask]
+
+        The teacher's prompt (DGR-enhanced) is prepended to the SAME response tokens
+        that the student generated. The response region is identified by response_mask
+        and is used by compute_self_distillation_loss to align student and teacher
+        logits (both use the same response tokens).
+
+        If the teacher prompt + response exceeds the maximum sequence length, the
+        prompt is truncated to leave room for the response. This mirrors the original
+        verl SDPO approach (teacher_prompt + responses → teacher_input_ids, with
+        teacher_prompt truncated via max_reprompt_len).
         """
         metrics = {}
         sd_batch = None
@@ -461,9 +487,15 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         try:
             device = batch.batch["input_ids"].device
+            # response_mask: [batch, max_seq_len] from IsoGraphRollout (full sequence mask)
             response_mask = batch.batch["response_mask"]
+            # responses: [batch, response_length] from IsoGraphRollout
             responses = batch.batch["responses"]
             batch_size = batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size") else responses.shape[0]
+
+            # Get student sequence length (includes prompt + response)
+            student_seq_len = batch.batch["input_ids"].shape[1]  # max_seq_len
+            response_length = responses.shape[1]  # fixed across batch
 
             # Collect feedback to build teacher batch
             feedback_list = []
@@ -472,14 +504,12 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 feedback_list.append(fb)
 
             # Filter to samples that have DGR feedback
-            has_feedback = [fb is not None for fb in feedback_list]
-            num_with_feedback = sum(has_feedback)
+            num_with_feedback = sum(1 for fb in feedback_list if fb is not None)
 
             if num_with_feedback == 0:
                 return None, metrics
 
             # Build teacher message with DGR context
-            # Template: {prompt}\n\n[DGR Feedback]\n{fb}\n\nCorrectly analyze the document...
             feedback_template = getattr(self_distillation_cfg, "feedback_template",
                                        "\n\n[Diagnostic Feedback]\n{fb}\n\n")
             reprompt_template = getattr(self_distillation_cfg, "reprompt_template",
@@ -494,7 +524,7 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 fb_text = feedback_list[i]
                 feedback_section = feedback_template.format(fb=fb_text)
 
-                # Get original prompt
+                # Get original prompt text
                 raw_prompt = batch.non_tensor_batch.get("raw_prompt", [[""] * batch_size])[i]
                 if isinstance(raw_prompt, list) and len(raw_prompt) > 0:
                     prompt_text = raw_prompt[-1]["content"] if isinstance(raw_prompt[-1], dict) else str(raw_prompt[-1])
@@ -506,79 +536,81 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                     feedback=feedback_section,
                     solution="",
                 )
-
                 messages.append(reprompt_text)
 
-            # Build teacher tensors for samples with feedback
+            # Build teacher tensors for all samples
             teacher_input_ids_list = []
             teacher_attention_mask_list = []
             teacher_position_ids_list = []
             self_distillation_mask_list = []
 
             max_reprompt_len = getattr(self_distillation_cfg, "max_reprompt_len", 512)
+            # Reserve space for response in the teacher sequence
+            teacher_prompt_max_len = max(1, max_reprompt_len - response_length)
+            pad_token_id = self.tokenizer.pad_token_id or 0
 
             for i in range(batch_size):
                 if messages[i] is None:
-                    # No feedback: use original prompt
-                    prompt_ids = batch.batch["input_ids"][i:i+1]
-                    prompt_mask = batch.batch["attention_mask"][i:i+1]
-                    response_ids = responses[i:i+1]
-                    response_mask_i = response_mask[i:i+1]
-
-                    teacher_input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-                    teacher_attention_mask = torch.cat([prompt_mask, response_mask_i], dim=1)
-                    teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+                    # No DGR feedback: use original student input as teacher input
+                    student_input = batch.batch["input_ids"][i]        # [student_seq_len]
+                    student_mask = batch.batch["attention_mask"][i]      # [student_seq_len]
+                    teacher_input = student_input
+                    teacher_mask = student_mask
                     sd_mask_val = 0.0
                 else:
-                    # Encode the reprompted message
+                    # Encode the DGR-prompted message
                     teacher_ids = self.tokenizer.encode(
                         messages[i],
                         add_special_tokens=True,
                         truncation=True,
-                        max_length=max_reprompt_len,
+                        max_length=teacher_prompt_max_len,
                     )
-                    teacher_ids = torch.tensor([teacher_ids], dtype=torch.long, device=device)
+                    teacher_ids = torch.tensor(teacher_ids, dtype=torch.long, device=device)
 
-                    prompt_ids = batch.batch["input_ids"][i:i+1]
-                    response_ids = responses[i:i+1]
-                    response_mask_i = response_mask[i:i+1]
+                    # Build teacher input: [DGR_prompt | response]
+                    response_ids = responses[i]  # [response_length]
+                    # response_mask[i] is the full-sequence mask (1 for response tokens, 0 for prompt/padding)
+                    # Since teacher_input_len == student_seq_len and student_seq_len = prompt + response_length,
+                    # the last response_length positions correspond to the response
+                    if response_mask is not None:
+                        resp_valid_mask = response_mask[i, -response_length:]  # [response_length]
+                    else:
+                        resp_valid_mask = torch.ones(response_length, device=device, dtype=torch.long)
+                    teacher_input = torch.cat([teacher_ids, response_ids], dim=0)
+                    teacher_mask = torch.cat([
+                        torch.ones_like(teacher_ids),  # DGR prompt: all valid
+                        resp_valid_mask,             # response: use response_mask
+                    ], dim=0)
 
-                    # Teacher input: reprompt + response
-                    teacher_input_ids = torch.cat([teacher_ids, response_ids], dim=1)
-                    teacher_attention_mask = torch.cat([
-                        torch.ones_like(teacher_ids),
-                        response_mask_i,
-                    ], dim=1)
-                    teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+                    # Pad teacher_input to student_seq_len for alignment
+                    teacher_input_len = teacher_input.shape[0]
+                    if teacher_input_len < student_seq_len:
+                        teacher_input = torch.cat([
+                            teacher_input,
+                            torch.full((student_seq_len - teacher_input_len,), pad_token_id, device=device, dtype=teacher_input.dtype)
+                        ])
+                        teacher_mask = torch.cat([
+                            teacher_mask,
+                            torch.zeros(student_seq_len - teacher_mask.shape[0], device=device, dtype=teacher_mask.dtype)
+                        ])
+                    elif teacher_input_len > student_seq_len:
+                        # Truncate teacher input to student_seq_len (keep beginning of DGR prompt + response)
+                        teacher_input = teacher_input[:student_seq_len]
+                        teacher_mask = teacher_mask[:student_seq_len]
+
                     sd_mask_val = 1.0
 
-                teacher_input_ids_list.append(teacher_input_ids)
-                teacher_attention_mask_list.append(teacher_attention_mask)
-                teacher_position_ids_list.append(teacher_position_ids)
+                teacher_input_ids_list.append(teacher_input.unsqueeze(0))
+                teacher_attention_mask_list.append(teacher_mask.unsqueeze(0))
+                teacher_position_ids_list.append(
+                    compute_position_id_with_mask(teacher_mask.unsqueeze(0))
+                )
                 self_distillation_mask_list.append(sd_mask_val)
 
-            # Pad to same length
-            max_len = max(t.size(1) for t in teacher_input_ids_list)
-            pad_token_id = self.tokenizer.pad_token_id or 0
-
-            teacher_input_ids_padded = torch.full(
-                (batch_size, max_len), pad_token_id, dtype=torch.long, device=device
-            )
-            teacher_attention_mask_padded = torch.zeros(
-                (batch_size, max_len), dtype=torch.long, device=device
-            )
-            teacher_position_ids_padded = torch.zeros(
-                (batch_size, max_len), dtype=torch.long, device=device
-            )
-
-            for i, (ids, mask, pos) in enumerate(zip(
-                teacher_input_ids_list, teacher_attention_mask_list, teacher_position_ids_list
-            )):
-                l = ids.size(1)
-                teacher_input_ids_padded[i, :l] = ids
-                teacher_attention_mask_padded[i, :l] = mask
-                teacher_position_ids_padded[i, :l] = pos
-
+            # Concatenate all samples to form batch tensors
+            teacher_input_ids = torch.cat(teacher_input_ids_list, dim=0)          # [batch, student_seq_len]
+            teacher_attention_mask = torch.cat(teacher_attention_mask_list, dim=0)  # [batch, student_seq_len]
+            teacher_position_ids = torch.cat(teacher_position_ids_list, dim=0)  # [batch, student_seq_len]
             self_distillation_mask = torch.tensor(
                 self_distillation_mask_list,
                 dtype=torch.float32,
@@ -586,9 +618,9 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
             )
 
             sd_batch = DataProto.from_dict(tensors={
-                "teacher_input_ids": teacher_input_ids_padded,
-                "teacher_attention_mask": teacher_attention_mask_padded,
-                "teacher_position_ids": teacher_position_ids_padded,
+                "teacher_input_ids": teacher_input_ids,
+                "teacher_attention_mask": teacher_attention_mask,
+                "teacher_position_ids": teacher_position_ids,
                 "self_distillation_mask": self_distillation_mask,
             })
 
@@ -628,6 +660,14 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         This is called after each policy update to maintain a stable
         Self-Teacher for the next iteration's dual-role forward pass.
+
+        The EMA teacher is stored as `actor_worker._isograph_ema_teacher` and
+        wired to `actor_worker.teacher_module` so that `dp_actor._forward_micro_batch`
+        picks it up as the teacher model (teacher_model = self.teacher_module or self.actor_module).
+
+        IMPORTANT: We store on actor_worker (the DataParallelPPOActor inside the
+        WorkerDict), NOT on the trainer. The actor_worker's teacher_module is read
+        directly by dp_actor.update_policy at line ~820.
         """
         try:
             actor_worker = self.actor_rollout_wg._workers[0]
@@ -651,6 +691,11 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 ):
                     t_param.data = decay * t_param.data + (1 - decay) * s_param.data
 
+            # CRITICAL: Wire EMA teacher to actor_worker's teacher_module.
+            # dp_actor._forward_micro_batch uses: teacher_model = self.teacher_module or self.actor_module.
+            # Without this assignment, self.teacher_module is None and the teacher = student (no distillation).
+            actor_worker.teacher_module = ema_teacher
+
             self.teacher_update_count += 1
 
         except Exception as e:
@@ -667,44 +712,13 @@ def apply_kl_penalty(data: DataProto, kl_ctrl, kl_penalty="kl"):
     return _apply_kl_penalty(data, kl_ctrl, kl_penalty)
 
 
-def compute_advantage(
-    data: DataProto,
-    adv_estimator: AdvantageEstimator,
-    gamma: float = 1.0,
-    lam: float = 1.0,
-    num_repeat: int = 1,
-    norm_adv_by_std_in_grpo: bool = True,
-    config=None,
-) -> DataProto:
-    """
-    Override compute_advantage to inject IsoGraph pre-computed advantages.
-
-    If batch already contains `isograph_advantages` (computed in
-    _maybe_build_self_distillation_batch), we use those instead of
-    recomputing GRPO/GAE advantages.
-    """
-    # Check if IsoGraph advantages are pre-computed
-    if "isograph_advantages_computed" in data.batch:
-        is_computed = data.batch["isograph_advantages_computed"].item()
-        if is_computed and "isograph_advantages" in data.batch:
-            advantages = data.batch.pop("isograph_advantages")
-            data.batch["advantages"] = advantages
-            # returns already has log π_teacher - log π_student (normalized)
-            # No need for GRPO/GAE computation
-            print("[IsoGraph] Using pre-computed IsoGraph advantages.")
-            return data
-
-    # Fall back to standard advantage computation
-    from verl.trainer.ppo.ray_trainer import compute_advantage as _compute_advantage
-    return _compute_advantage(
-        data,
-        adv_estimator=adv_estimator,
-        gamma=gamma,
-        lam=lam,
-        num_repeat=num_repeat,
-        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        config=config,
-    )
+# NOTE: The isograph advantages early-return check is now in
+# verl/trainer/ppo/ray_trainer.py:compute_advantage() (added there directly).
+# This avoids the dead-code problem of overriding compute_advantage as a
+# module-level function (which is never called — fit() calls the one from
+# ray_trainer.py directly). The check in ray_trainer.compute_advantage() reads
+# batch.batch["isograph_advantages_computed"] which is set by
+# IsoGraphRayPPOTrainer._maybe_build_self_distillation_batch().
 
 
 # ============================================================================

@@ -29,7 +29,13 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, compute_self_distillation_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_self_distillation_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+)
+from verl.trainer.ppo.isograph_sdpo import compute_policy_loss_isograph
 from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
@@ -681,7 +687,7 @@ class DataParallelPPOActor(BasePPOActor):
         pad_token_id = data.meta_info.get("pad_token_id", 0)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
-        self_distillation_enabled = loss_mode == "sdpo"
+        self_distillation_enabled = loss_mode in ("sdpo", "isograph")
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         if self_distillation_enabled:
             self_distillation_required_keys = {
@@ -690,7 +696,8 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
-            assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
+            assert self_distillation_required_keys.issubset(set(data.batch.keys())), \
+                f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
             "responses",
@@ -774,7 +781,6 @@ class DataParallelPPOActor(BasePPOActor):
                     teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
                     if teacher_regularization == "trust-region" and self.use_fused_kernels:
                         raise ValueError("trust-region teacher requires disabling fused kernels to access logits.")
-                    # all return: (bsz, response_length)
                     return_all_logps = self_distillation_cfg.full_logit_distillation and not self_distillation_cfg.distillation_topk
                     distill_topk = self_distillation_cfg.distillation_topk if self_distillation_cfg.full_logit_distillation else None
                     outputs = self._forward_micro_batch(
@@ -790,7 +796,6 @@ class DataParallelPPOActor(BasePPOActor):
                     student_topk_logps = outputs.get("topk_logps") if distill_topk else None
                     student_topk_indices = outputs.get("topk_indices") if distill_topk else None
 
-                    # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
                     else:
@@ -799,60 +804,87 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
-
-                    # Extract pre-computed rollout correction weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
 
                     if self_distillation_enabled:
-                        teacher_inputs = {
-                            "responses": model_inputs["responses"],
-                            "input_ids": model_inputs["teacher_input_ids"],
-                            "attention_mask": model_inputs["teacher_attention_mask"],
-                            "position_ids": model_inputs["teacher_position_ids"],
-                        }
-                        teacher_model = self.teacher_module or self.actor_module
-                        if teacher_regularization == "trust-region" and (
-                            self.teacher_module is None or self.teacher_module is self.actor_module
-                        ):
-                            raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
-                        with torch.no_grad():
-                            teacher_outputs = self._forward_micro_batch(
-                                teacher_inputs,
-                                temperature=temperature,
-                                calculate_entropy=False,
-                                return_all_logps=return_all_logps,
-                                distill_topk=distill_topk,
-                                topk_indices=student_topk_indices,
-                                module=teacher_model,
+                        if loss_mode == "isograph":
+                            # ============================================================
+                            # IsoGraph SDPO: dual-role forward pass + token-level loss
+                            # ============================================================
+                            teacher_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids"],
+                                "attention_mask": model_inputs["teacher_attention_mask"],
+                                "position_ids": model_inputs["teacher_position_ids"],
+                            }
+                            teacher_model = self.teacher_module or self.actor_module
+                            with torch.no_grad():
+                                teacher_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    module=teacher_model,
+                                )
+                            teacher_log_prob = teacher_outputs["log_probs"]
+                            ref_log_prob = model_inputs.get("ref_log_prob")
+                            pg_loss, pg_metrics = compute_policy_loss_isograph(
+                                old_log_prob=old_log_prob,
+                                log_prob=log_prob,
+                                advantages=advantages,
+                                response_mask=response_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                config=self.config,
+                                rollout_is_weights=rollout_is_weights,
+                                teacher_log_probs=teacher_log_prob,
+                                ref_log_probs=ref_log_prob,
                             )
-                        teacher_log_prob = teacher_outputs["log_probs"]
-                        teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
-                        teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
-                        pg_loss, pg_metrics = compute_self_distillation_loss(
-                            student_log_probs=log_prob,
-                            teacher_log_probs=teacher_log_prob,
-                            response_mask=response_mask,
-                            self_distillation_config=self_distillation_cfg,
-                            old_log_probs=old_log_prob,
-                            student_all_log_probs=student_all_logps,
-                            teacher_all_log_probs=teacher_all_logps,
-                            student_topk_log_probs=student_topk_logps,
-                            teacher_topk_log_probs=teacher_topk_logps,
-                            self_distillation_mask=self_distillation_mask,
-                            loss_agg_mode=loss_agg_mode,
-                            rollout_is_weights=rollout_is_weights,
-                        )
-
-                        pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
-                        micro_batch_metrics.update(pg_metrics)
+                            micro_batch_metrics.update(pg_metrics)
+                        else:
+                            # Standard SDPO with full-logit distillation
+                            teacher_inputs = {
+                                "responses": model_inputs["responses"],
+                                "input_ids": model_inputs["teacher_input_ids"],
+                                "attention_mask": model_inputs["teacher_attention_mask"],
+                                "position_ids": model_inputs["teacher_position_ids"],
+                            }
+                            teacher_model = self.teacher_module or self.actor_module
+                            if teacher_regularization == "trust-region" and (
+                                self.teacher_module is None or self.teacher_module is self.actor_module
+                            ):
+                                raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
+                            with torch.no_grad():
+                                teacher_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                            teacher_log_prob = teacher_outputs["log_probs"]
+                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                            pg_loss, pg_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                            pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                            micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                         # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-                        # Compute policy loss (any function is expected to return 2 values)
                         pg_loss, pg_metrics = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -886,16 +918,20 @@ class DataParallelPPOActor(BasePPOActor):
                             policy_loss -= entropy_agg * entropy_coeff
 
                     if self.config.use_kl_loss:
-                        ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
-                        kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
-                        )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        # For isograph mode, KL penalty is already included inside compute_policy_loss_isograph.
+                        # Skip the separate KL loss to avoid double-counting.
+                        if loss_mode == "isograph":
+                            pass  # KL already in pg_loss
+                        else:
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
-                        micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                            policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                            metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

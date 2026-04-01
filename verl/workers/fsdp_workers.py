@@ -647,7 +647,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        if rollout_name == "hf":
+
+        # Check loss_mode to determine which rollout class to use.
+        # For isograph mode, we use IsoGraphRollout for interactive env feedback
+        # even when rollout.name is "hf". This is controlled by the yaml config.
+        loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
+        use_isograph_rollout = (
+            loss_mode == "isograph"
+            and getattr(self.config.rollout, "use_isograph_rollout", True)
+        )
+
+        if use_isograph_rollout:
+            from verl.workers.rollout.isograph_rollout import IsoGraphRollout
+
+            self.rollout = IsoGraphRollout(
+                module=self.actor_module_fsdp,
+                config=rollout_config,
+                tokenizer=self.tokenizer,   # from FSDPWorkerRole/FSDPActorRolloutRefWorkerGroup
+            )
+        elif rollout_name == "hf":
             from verl.workers.rollout.hf_rollout import HFRollout
 
             self.rollout = HFRollout(module=self.actor_module_fsdp, config=rollout_config)
