@@ -16,18 +16,30 @@
 # ============================================================================
 # IsoGraph SDPO Configuration
 # ============================================================================
+# Integration: Members A + B + C
+#
 # This config extends ppo_trainer with IsoGraph-specific settings:
 #   - actor.policy_loss.loss_mode: isograph (activates compute_policy_loss_isograph)
 #   - actor.policy_loss.isograph.*: IsoGraphSDPOConfig hyperparameters
 #   - actor.self_distillation.*: DGR feedback injection templates
-#   - algorithm.adv_estimator: grpo (critic-free; advantages overridden by trainer)
+#   - isograph.use_dummy_env: true (DummyEnvironment) or false (Member C's VE-MDP)
+#   - isograph.oracle_graph_path: path to single oracle graph JSON
+#   - isograph.oracle_graph_dir: path to Member B's data-B directory (page_*.json files)
 #
 # Usage:
+#   # Member C's real VE-MDP environment:
 #   python -m verl.trainer.train_isograph_sdpo \
 #     --config-name=isograph_sdpo \
-#     actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
-#     data.train_files=/path/to/train.parquet \
-#     data.val_files=/path/to/val.parquet \
+#     isograph.use_dummy_env=false \
+#     isograph.oracle_graph_dir=/path/to/data-B \
+#     isograph.svm_backend=dummy \
+#     ...
+#
+#   # Dummy environment (no Member C needed):
+#   python -m verl.trainer.train_isograph_sdpo \
+#     --config-name=isograph_sdpo \
+#     isograph.use_dummy_env=true \
+#     isograph.oracle_graph_path=/path/to/oracle.json \
 #     ...
 #
 # Hydra overrides: model, data, training hyperparameters
@@ -35,7 +47,7 @@
 
 defaults:
 
-  # Inherit all defaults from ppo_trainer (includes ref, rollout, data, etc.)
+  # Inherit all defaults from ppo_trainer
   - ppo_trainer
 
   # Override actor config with our SDPO-specific settings
@@ -62,27 +74,27 @@ actor_rollout_ref:
     # --------------------------------------------------------------------------
     fsdp_config:
 
-      # Offload model parameters to CPU when not needed (saves GPU memory)
+      # Offload model parameters to CPU when not needed
       param_offload: true
 
-      # Offload optimizer states to CPU (saves ~28GB for 7B model with AdamW)
+      # Offload optimizer states to CPU
       optimizer_offload: true
 
     # --------------------------------------------------------------------------
     # Batch size configuration
     # --------------------------------------------------------------------------
-    # Use dynamic batch sizing for flexible memory management
     use_dynamic_bsz: true
 
     # --------------------------------------------------------------------------
-    # KL penalty configuration (required for IsoGraph SDPO token-level KL)
+    # KL penalty configuration (OPTIONAL for IsoGraph SDPO on single-GPU machines)
     # --------------------------------------------------------------------------
-    # Enable KL penalty against reference model.
-    # This makes ref_log_prob available in dp_actor micro-batch,
-    # which is used by compute_policy_loss_isograph for token-level KL penalty.
-    use_kl_loss: true
+    # Set use_kl_loss=false on single-GPU / low-VRAM machines to skip loading
+    # the reference model (saves ~16 GB GPU memory). The IsoGraph SDPO advantage
+    # A_t = log π_teacher - log π_student is still computed without the ref.
+    # The KL penalty term -β·KL(π_θ||π_ref) is gracefully skipped.
+    use_kl_loss: false
 
-    # Maximum tokens per GPU per micro batch (for dynamic batching)
+    # Maximum tokens per GPU per micro batch
     ppo_max_token_len_per_gpu: 4096
 
     # --------------------------------------------------------------------------
@@ -91,24 +103,17 @@ actor_rollout_ref:
     policy_loss:
 
       # Loss mode: isograph | sdpo | vanilla | grpo | ...
-      # Set to "isograph" to activate compute_policy_loss_isograph
       loss_mode: isograph
 
-      # IsoGraph-specific hyperparameters (extracted as IsoGraphSDPOConfig)
-      # These map to the IsoGraphSDPOConfig dataclass fields
       isograph:
 
-        # PPO clipping parameter ε (controls policy update magnitude)
+        # PPO clipping parameter ε
         clip_ratio: 0.2
 
         # KL penalty coefficient β (regularizes against reference model)
-        # Small β ≈ 0.01: let SDPO drive learning, KL as monitor
-        # Large β ≈ 0.1: strong regularization toward pretrained model
         beta: 0.01
 
         # EMA decay rate for Self-Teacher model
-        # High decay ≈ 0.999: very slow-moving teacher (stable but lagging)
-        # Low decay ≈ 0.9: fast-adapting teacher (responsive but noisy)
         ema_decay: 0.99
 
         # Whether to normalize token-level advantages
@@ -117,22 +122,13 @@ actor_rollout_ref:
         # Loss aggregation mode: token-mean | seq-mean-token-sum | seq-mean-token-mean
         loss_agg_mode: token-mean
 
-        # FGW (Fused Gromov-Wasserstein) verification thresholds
-        # These trigger different critiques in the DGR (Diagnostic Graph Report)
-
-        # Node alignment threshold: S_node below this → "entity hallucination"
-        tau_node: 0.8
-
-        # Edge topology threshold: S_edge below this → "spatial misreasoning"
-        tau_edge: 0.7
-
-        # Reading order threshold: S_order below this → "sequential logic error"
-        tau_order: 0.6
+        # FGW verification thresholds
+        tau_node: 0.8   # Node alignment: below this → "entity hallucination"
+        tau_edge: 0.7   # Edge topology: below this → "spatial misreasoning"
+        tau_order: 0.6 # Reading order: below this → "sequential logic error"
 
         # FGW balance parameter α
         # α = 0.5: equal weight to semantic cost and topological cost
-        # α → 0: emphasize semantic (text/IoU) matching
-        # α → 1: emphasize topological (edge) matching
         fgw_alpha: 0.5
 
     # --------------------------------------------------------------------------
@@ -140,36 +136,14 @@ actor_rollout_ref:
     # --------------------------------------------------------------------------
     self_distillation:
 
-      # Maximum length of the reprompted prompt (teacher input)
       max_reprompt_len: 4096
-
-      # IS (importance sampling) clip threshold; null disables IS weighting
-      # Prevents extreme importance weights from destabilizing training
       is_clip: 2.0
-
-      # Don't reprompt from self-success (avoid mode collapse)
       dont_reprompt_on_self_success: true
-
-      # Remove CoT thinking trace from demonstrations
       remove_thinking_from_demonstration: true
-
-      # Include environment/DGR feedback in reprompting for wrong attempts
       include_environment_feedback: true
-
-      # Only use feedback when no solution is available
-      # (avoid over-relying on feedback when better solutions exist)
       environment_feedback_only_without_solution: true
 
-      # ------------------------------------------------------------------------
-      # Prompt templates for self-distillation reprompting
-      # ------------------------------------------------------------------------
-      # Available variables:
-      #   {prompt}                  - original user prompt
-      #   {successful_previous_attempt} - correct solution from another sample in the group
-      #   {feedback_raw}            - DGR / environment diagnostic feedback
-      # ------------------------------------------------------------------------
-
-      # Full reprompt template: {prompt}\n{solution}\n{feedback}
+      # Prompt templates
       reprompt_template: |-
         {prompt}
 
@@ -179,12 +153,10 @@ actor_rollout_ref:
 
         Carefully re-analyze the document and provide your answer.
 
-      # Solution block inserted when a correct solution exists
       solution_template: |-
         Correct solution:
         {successful_previous_attempt}
 
-      # Feedback block: DGR diagnostic text from VE-MDP verification
       feedback_template: |-
         [DGR Diagnostic Report]:
         {feedback_raw}
@@ -193,18 +165,10 @@ actor_rollout_ref:
     # Optimizer / learning rate
     # --------------------------------------------------------------------------
     optim:
-
-      # Learning rate for SDPO
-      # Typical range: 1e-6 (conservative) to 5e-6 (aggressive)
-      # SDPO is critic-free so can use slightly higher LR than PPO
       lr: 1e-6
-
       weight_decay: 0.01
-
       lr_warmup_steps: 10
-
       lr_warmup_steps_ratio: 0.0
-
       total_training_steps: -1
 
   # --------------------------------------------------------------------------
@@ -212,33 +176,17 @@ actor_rollout_ref:
   # --------------------------------------------------------------------------
   rollout:
 
-    # Use IsoGraphRollout for interactive env feedback when loss_mode=isograph
     use_isograph_rollout: true
-
-    # Number of rollouts per update (n in the paper)
-    # Higher n = more data per update = better gradient estimate
-    # For small models: n=4 to reduce memory
-    # For 7B models: n=8 (as in paper)
     n: 4
-
-    # Log probability computation during rollout
-    # MUST be True for SDPO (we need old_log_probs for IS ratio)
     calculate_log_probs: true
-
-    # Maximum new tokens to generate per rollout
-    # Adjust based on task complexity
     response_length: 512
 
   # --------------------------------------------------------------------------
-  # Reference model configuration (for KL penalty)
+  # Reference model configuration
   # --------------------------------------------------------------------------
   ref:
-
-    # Reference model offloading: keep on CPU to save GPU memory
     fsdp_config:
-
       param_offload: true
-
       optimizer_offload: false
 
 
@@ -248,23 +196,10 @@ actor_rollout_ref:
 
 algorithm:
 
-  # Advantage estimator:
-  #   grpo: Group-relative advantage (critic-free; recommended for SDPO)
-  #   gae:  Generalized Advantage Estimation (requires value model / critic)
-  # For SDPO, we override advantages in the trainer to use IsoGraph's
-  # dual-role advantage: A_t = log(π_teacher) - log(π_student)
   adv_estimator: grpo
-
-  # Normalize GRPO advantages by std across the group
   norm_adv_by_std_in_grpo: false
-
-  # KL penalty applied to rewards (β * KL in reward)
   use_kl_in_reward: false
-
-  # Discount factor (γ = 1.0 for supervised tasks)
   gamma: 1.0
-
-  # GAE lambda (irrelevant for GRPO; only used when adv_estimator=gae)
   lam: 1.0
 
 
@@ -275,29 +210,17 @@ algorithm:
 data:
 
   # Training and validation parquet files
-  # Override via command line: data.train_files=/path/to/train.parquet
+  # Each parquet row should contain: prompt (JSON string), reward_model (float), image_id (str, optional)
   train_files: null
-
   val_files: null
 
-  # Default: small batch for quick iteration during debugging
   train_batch_size: 1
-
   max_prompt_length: 1024
-
   max_response_length: 512
-
-  # Filter prompts that are too long (error | truncate | passthrough)
   filter_overlong_prompts: true
-
   truncation: error
-
   shuffle: true
-
-  # Number of dataloader workers (0 for debugging, >0 for production)
   dataloader_num_workers: 0
-
-  # Trust remote code in tokenizer/processor
   trust_remote_code: false
 
 
@@ -307,46 +230,19 @@ data:
 
 trainer:
 
-  # Number of training epochs
   total_epochs: 3
-
-  # Validation before training (good for sanity checks)
   val_before_train: true
-
-  # Logger: console | wandb | tensorboard
   logger: console
-
-  # Number of GPUs per node
-  # Override with actual GPU count: trainer.n_gpus_per_node=8
   n_gpus_per_node: 1
-
-  # Number of nodes
   nnodes: 1
-
-  # Checkpointing
   save_freq: 10
-
-  # Validation frequency
   test_freq: 5
-
-  # Experiment naming
   project_name: isograph_sdpo
   experiment_name: qwen2_5_vl_7b_isograph
-
-  # Local checkpoint directory
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
-
-  # Resume mode: auto | disable | resume_path
   resume_mode: disable
-
-  # Disable batch balancing for small models (simpler debugging)
   balance_batch: false
-
-  # Critic warmup: SDPO is critic-free so set to 0
   critic_warmup: 0
-
-  # Use legacy worker implementation (required for SDPO)
-  # The new worker engine does not support colocated teacher
   use_legacy_worker_impl: enable
 
 
@@ -356,11 +252,7 @@ trainer:
 
 critic:
 
-  # Critic strategy
   strategy: fsdp2
-
-  # SDPO does not use a critic; set warmup very high to effectively disable
-  # Alternatively, set adv_estimator=grpo to skip critic entirely
   ppo_mini_batch_size: 256
 
 
@@ -370,30 +262,62 @@ critic:
 
 reward_model:
 
-  # Disable reward model for rule-based tasks
   enable: false
 
 
 # ============================================================================
-# IsoGraph-specific top-level config
+# IsoGraph-specific configuration
 # ============================================================================
+# Controls which VE-MDP environment to use and where to find data.
 
 isograph:
 
-  # Path to the oracle graph JSON for DummyEnvironment
-  # Override with: isograph.oracle_graph_path=/path/to/oracle_graph.json
+  # --------------------------------------------------------------------------
+  # Environment selection
+  # --------------------------------------------------------------------------
+  # use_dummy_env=true  → DummyEnvironment (pure Python, no Member C needed)
+  # use_dummy_env=false → Member C's IsoGraphEnvironment (requires ISOGraph-C package)
+  use_dummy_env: true
+
+  # --------------------------------------------------------------------------
+  # Oracle graph paths
+  # --------------------------------------------------------------------------
+  # Path to a single oracle graph JSON file.
+  # Used when use_dummy_env=true (always) or as fallback when oracle_graph_dir is not set.
+  # Format: {image_id, adversarial_scenario, metadata: {width, height}, oracle_graph: {nodes, edges}}
   oracle_graph_path: null
 
-  # Use DummyEnvironment (True for now; False when Member C's VE_MDP is ready)
-  use_dummy_env: true
+  # Path to Member B's data directory containing page_*.json files.
+  # When set, the trainer indexes all JSON files and performs per-sample
+  # oracle graph lookup by image_id during DGR feedback generation.
+  # Each JSON file must follow the ImageDataSchema format.
+  oracle_graph_dir: null
+
+  # --------------------------------------------------------------------------
+  # Member C: Image path (for real VE-MDP zoom action)
+  # --------------------------------------------------------------------------
+  # Path to source image file (e.g., data-B/page_000.png).
+  # Required when use_dummy_env=false and you want real image cropping.
+  # When null, IsoGraphEnvironment falls back to textual description.
+  image_path: null
+
+  # --------------------------------------------------------------------------
+  # Member C: SVM backend
+  # --------------------------------------------------------------------------
+  # "dummy": Use oracle-based simulation (DummySVM).
+  #          Returns nodes from the oracle graph that overlap the zoomed patch.
+  # "onnx":  Use real ONNX layout model. Requires svm_model_path to be set.
+  svm_backend: dummy
+
+  # Path to ONNX SVM model file. Required when svm_backend=onnx.
+  svm_model_path: null
 
 
 # ============================================================================
-# Profiler configuration (disabled by default)
+# Profiler configuration
 # ============================================================================
 
 global_profiler:
 
   tool: null
-
   steps: null

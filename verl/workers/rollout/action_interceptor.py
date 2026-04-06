@@ -19,6 +19,10 @@ This module implements the core interception mechanism for VE-MDP interaction:
 2. Suspends generation when <zoom> or <call_svm> tokens are detected
 3. Calls environment.step() to get visual evidence feedback
 4. Resumes generation with environment feedback appended to context
+
+The environment is supplied by IsoGraphRollout and can be either:
+- DummyEnvironment (pure Python, no external deps)
+- Member C's IsoGraphEnvironment (production VE-MDP with FGW + DGR + SVM)
 """
 
 import re
@@ -26,12 +30,11 @@ import torch
 import torch.nn.functional as F
 from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass, field
-from enum import Enum
 
-from .isograph_env import DummyEnvironment, ActionResult, ActionType
+from .isograph_env import create_environment, get_environment_class
 
 
-class InterceptState(Enum):
+class InterceptState:
     """States during interceptive generation."""
     GENERATING = "generating"
     SUSPENDED = "suspended"
@@ -82,29 +85,36 @@ class ActionInterceptor:
         self,
         module: torch.nn.Module,
         tokenizer: Any,
-        environment: Optional[DummyEnvironment] = None,
+        environment: Optional[Any] = None,
         max_interactions: int = 10,
         max_context_length: int = 4096,
         device: str = "cuda",
     ):
         """
         Initialize Action Interceptor.
-        
+
         Args:
-            module: The MLLM module (must support HF-style forward: input_ids, attention_mask, position_ids)
-            tokenizer: HuggingFace tokenizer for decoding
-            environment: Environment for action execution (DummyEnvironment or VE-MDP)
+            module: The MLLM module (must support HF-style forward)
+            tokenizer: HuggingFace tokenizer
+            environment: VE-MDP environment instance.
+                Supports both DummyEnvironment and Member C's IsoGraphEnvironment.
+                When None, creates DummyEnvironment as fallback.
             max_interactions: Maximum number of env interactions per trajectory
-            max_context_length: Maximum context length to prevent OOM
+            max_context_length: Maximum context length
             device: Device for tensor operations
         """
         self.module = module
         self.tokenizer = tokenizer
-        self.environment = environment or DummyEnvironment(device=device)
         self.max_interactions = max_interactions
         self.max_context_length = max_context_length
         self.device = device
-        
+
+        if environment is not None:
+            self.environment = environment
+        else:
+            # Fallback to DummyEnvironment (no Member C needed)
+            self.environment = create_environment(device=device)
+
         # Pre-compile action patterns
         self._compile_patterns()
     
@@ -370,13 +380,13 @@ class ActionInterceptor:
     
     def generate_batch_with_interaction(
         self,
-        prompts: "DataProto",  # type: ignore # Forward reference
+        prompts: Any,  # DataProto containing batch of prompts
         max_new_tokens: int = 512,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
         top_p: float = 1.0,
         do_sample: bool = True,
-    ) -> Tuple[List[torch.Tensor], List[InterceptedTrajectory]]:
+    ) -> Tuple[List[torch.Tensor], List[Any]]:
         """
         Batch generation with action interception.
         
@@ -394,7 +404,7 @@ class ActionInterceptor:
                 trajectories: List of InterceptedTrajectory objects
         """
         from verl import DataProto
-        
+
         idx = prompts.batch["input_ids"]
         attention_mask = prompts.batch["attention_mask"]
         position_ids = prompts.batch["position_ids"]

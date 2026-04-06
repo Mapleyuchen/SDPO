@@ -1,55 +1,18 @@
 #!/usr/bin/env python3
-# Copyright 2026 IsoGraph Team
-# NeurIPS 2026 Submission: IsoGraph (Active-Symbolic SDPO)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """
 IsoGraph SDPO — End-to-End Training Script (verl-based).
 
+Integration: Members A + B + C
+
 This script provides a complete end-to-end training entry point for the
 IsoGraph (Active-Symbolic SDPO) framework, built on top of verl's RayPPOTrainer.
-
-Design overview:
-  1. Registers compute_policy_loss_isograph with verl's POLICY_LOSS_REGISTRY
-     (activated by actor.policy_loss.loss_mode: isograph)
-  2. Subclasses RayPPOTrainer → IsoGraphRayPPOTrainer
-     Overrides _maybe_build_self_distillation_batch to inject:
-       - DGR feedback from DummyEnvironment (VE-MDP verification)
-       - Custom IsoGraph advantage computation via dual-role forward pass
-         A_t = stop_gradient(log π_θ') - log π_θ  (TEACHER - STUDENT)
-  3. The PPO update uses the IsoGraph advantage + PPO clip + KL penalty
-  4. EMA teacher is updated after each policy step
-
-Usage:
-  # Qwen2.5-0.5B (recommended for debugging)
-  bash examples/isograph_trainer/run_isograph_sdpo.sh
-
-  # Qwen2.5-1.5B (intermediate)
-  MODEL_NAME=Qwen/Qwen2.5-1.5B-Instruct bash examples/isograph_trainer/run_isograph_sdpo.sh
-
-  # With Hydra overrides (no need to edit YAML)
-  python -m verl.trainer.main_ppo \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
-    data.train_files=/path/to/train.parquet \
-    data.val_files=/path/to/val.parquet \
-    ...
 
 Architecture (four stages):
   Stage 1 — Active Exploration (VE-MDP):
     MLLM generates <zoom>/<call_svm> → env.step() → local graph G_l
 
   Stage 2 — Mathematical Dissection (FGW Verification):
-    G_l vs. oracle G_g via FGW optimal transport → S_node, S_edge, S_order
+    G_l vs. oracle G_g via Fused Gromov-Wasserstein optimal transport → S_node, S_edge, S_order
 
   Stage 3 — Semantic Grounding (DGR):
     FGW scores → Diagnostic Graph Report f_DGR (natural language critique)
@@ -58,16 +21,28 @@ Architecture (four stages):
     Student π_θ (blind) vs. Self-Teacher π_θ' (with f_DGR, no_grad, EMA)
     → Token-level advantage A_t → PPO clipped loss - β·KL(ref)
     → Policy update without Critic network
+
+Usage:
+  # Member C's real VE-MDP environment (recommended for full integration):
+  ISOGRAPH_C_ROOT=/path/to/ISOGraph-C \
+      bash examples/isograph_trainer/run_isograph_sdpo.sh
+
+  # Dummy environment (no Member C dependency):
+  bash examples/isograph_trainer/run_isograph_sdpo.sh
+
+  # With Member B's data (data-B/page_*.json):
+  ISOGRAPH_C_ROOT=/path/to/ISOGraph-C \
+  ISOGRAPH_ORACLE_GRAPH_DIR=/path/to/data-B \
+      bash examples/isograph_trainer/run_isograph_sdpo.sh
 """
 
 import os
 import sys
-import uuid
-import socket
 import math
+import glob
+import json
 from copy import deepcopy
 from collections import defaultdict
-from pprint import pprint
 from typing import Optional, Any
 
 import torch
@@ -76,11 +51,8 @@ import numpy as np
 import ray
 
 from omegaconf import OmegaConf
-from torch.utils.data import Dataset, Sampler
-from torchdata.stateful_dataloader import StatefulDataLoader
-from tqdm import tqdm
 
-# Ensure IsoGraph modules are on the path
+# Ensure verl and SDPO are on the path
 SDPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 VERL_ROOT = os.path.join(SDPO_ROOT, "verl")
 sys.path.insert(0, SDPO_ROOT)
@@ -88,8 +60,6 @@ sys.path.insert(0, VERL_ROOT)
 
 # ============================================================================
 # STEP 1: Register IsoGraph SDPO policy loss with verl's registry
-# This MUST happen before the trainer is instantiated so that the registry
-# already contains "isograph" when Ray workers look up the loss function.
 # ============================================================================
 try:
     from verl.trainer.ppo.isograph_sdpo import compute_policy_loss_isograph
@@ -111,12 +81,10 @@ from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy
 from verl.utils import tensordict_utils as tu
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, calculate_workload, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean as verl_masked_mean
 from verl.utils.debug import marked_timer
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.metric import reduce_metrics
-from verl.utils.debug import marked_timer as _marked_timer
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -129,24 +97,21 @@ from verl.trainer.ppo.isograph_sdpo import (
     compute_isograph_advantage,
     compute_dual_role_forward_pass,
 )
-from verl.workers.rollout.isograph_env import DummyEnvironment
+
+# Environment factory: selects Member C's IsoGraphEnvironment when available
+# and isograph.use_dummy_env=false, otherwise falls back to DummyEnvironment.
+from verl.workers.rollout.isograph_env import (
+    create_environment,
+    get_environment_class,
+    ActionType,
+)
+
 from verl.utils.dataset.rl_dataset import collate_fn
 
+# ============================================================================
+# STEP 4: IsoGraphRayPPOTrainer
+# ============================================================================
 
-# ============================================================================
-# STEP 4: Patch verl's masked_mean to handle both verl_F and torch implementations
-# (some verl versions expose it differently)
-# ============================================================================
-try:
-    import verl.utils.torch_functional as verl_F
-    _has_verl_F = True
-except ImportError:
-    _has_verl_F = False
-
-
-# ============================================================================
-# STEP 5: IsoGraphRayPPOTrainer
-# ============================================================================
 
 class IsoGraphRayPPOTrainer(RayPPOTrainer):
     """
@@ -154,15 +119,11 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
     Key modifications vs. vanilla RayPPOTrainer:
     1. Overrides _maybe_build_self_distillation_batch to inject DGR feedback
-       from DummyEnvironment (VE-MDP) AND compute IsoGraph token-level
+       from the VE-MDP environment AND compute IsoGraph token-level
        advantages via the dual-role forward pass.
     2. Uses loss_mode="isograph" to activate compute_policy_loss_isograph.
     3. Tracks EMA teacher update metrics.
-
-    Usage:
-        trainer = IsoGraphRayPPOTrainer(config=..., ...)
-        trainer.init_workers()
-        trainer.fit()
+    4. Supports per-sample oracle graphs from Member B's data directory.
     """
 
     def __init__(
@@ -170,7 +131,9 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         *args,
         isograph_config: Optional[IsoGraphSDPOConfig] = None,
         oracle_graph_path: Optional[str] = None,
+        oracle_graph_dir: Optional[str] = None,
         use_dummy_env: bool = True,
+        isograph_env=None,
         **kwargs,
     ):
         """
@@ -178,33 +141,127 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         Args:
             isograph_config: Hyperparameters for IsoGraph SDPO.
-            oracle_graph_path: Path to oracle graph JSON for DummyEnvironment.
-            use_dummy_env: Whether to use DummyEnvironment (True for now).
+            oracle_graph_path: Path to single oracle graph JSON.
+            oracle_graph_dir: Path to directory containing Member B's
+                page_*.json oracle graphs. When set, loads oracle graphs
+                per-sample by matching image_id in the parquet data.
+            use_dummy_env: Whether to use DummyEnvironment (True) or
+                Member C's IsoGraphEnvironment (False).
+            isograph_env: Pre-constructed environment instance. When provided,
+                overrides oracle_graph_path / use_dummy_env.
         """
         super().__init__(*args, **kwargs)
 
         self.isograph_config = isograph_config or IsoGraphSDPOConfig()
         self.oracle_graph_path = oracle_graph_path
+        self.oracle_graph_dir = oracle_graph_dir
         self.use_dummy_env = use_dummy_env
 
-        # Create DummyEnvironment if enabled
-        if self.use_dummy_env:
+        # ---- Build per-sample oracle graph index ----
+        # Map: image_id -> oracle_graph_dict
+        self._oracle_graph_index: dict[str, dict] = {}
+        self._index_oracle_graphs()
+
+        # ---- Create environment ----
+        if isograph_env is not None:
+            # External environment provided (e.g., constructed with Member C's class)
+            self.isograph_env = isograph_env
+            self.use_dummy_env = False
+            print(f"[IsoGraph] Using provided environment: {type(isograph_env).__name__}")
+        elif self.use_dummy_env:
             oracle_path = self.oracle_graph_path or os.path.join(
                 SDPO_ROOT, "global_oracle_graph_demo.json"
             )
-            self.dummy_env = DummyEnvironment(
-                device="cuda" if torch.cuda.is_available() else "cpu",
+            self.isograph_env = create_environment(
                 oracle_graph_path=oracle_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
             )
             print(f"[IsoGraph] DummyEnvironment initialized with oracle: {oracle_path}")
         else:
-            self.dummy_env = None
+            # Member C's production IsoGraphEnvironment
+            oracle_path = self.oracle_graph_path or self._default_oracle_path()
+            self.isograph_env = create_environment(
+                oracle_graph_path=oracle_path,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                svm_backend="dummy",  # or "onnx" when real SVM is available
+            )
+            print(
+                f"[IsoGraph] Member C IsoGraphEnvironment initialized with "
+                f"oracle: {oracle_path} (backend: {get_environment_class().__name__})"
+            )
 
         # EMA teacher state
         self.teacher_update_count = 0
-
-        # IsoGraph metrics accumulator
         self.isograph_metrics: dict = defaultdict(list)
+
+    def _default_oracle_path(self) -> str:
+        """Return a default oracle graph path."""
+        return os.path.join(SDPO_ROOT, "global_oracle_graph_demo.json")
+
+    def _index_oracle_graphs(self) -> None:
+        """
+        Load all oracle graphs from oracle_graph_dir (Member B's data directory)
+        into an in-memory index keyed by image_id.
+
+        This enables per-sample DGR feedback generation when training on
+        Member B's data-B/page_*.json files.
+        """
+        if not self.oracle_graph_dir:
+            return
+
+        if not os.path.isdir(self.oracle_graph_dir):
+            print(f"[IsoGraph] oracle_graph_dir not found: {self.oracle_graph_dir}")
+            return
+
+        pattern = os.path.join(self.oracle_graph_dir, "*.json")
+        files = glob.glob(pattern)
+
+        if not files:
+            print(f"[IsoGraph] No JSON files found in {self.oracle_graph_dir}")
+            return
+
+        for filepath in files:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+                image_id = data.get("image_id", os.path.basename(filepath))
+                oracle_graph = data.get("oracle_graph", data)
+
+                self._oracle_graph_index[image_id] = oracle_graph
+            except Exception as e:
+                print(f"[IsoGraph] Warning: Failed to load oracle graph {filepath}: {e}")
+
+        print(
+            f"[IsoGraph] Indexed {len(self._oracle_graph_index)} oracle graphs "
+            f"from {self.oracle_graph_dir}"
+        )
+
+    def _resolve_oracle_graph(self, sample: Any) -> Optional[dict]:
+        """
+        Resolve the oracle graph for a single training sample.
+
+        Priority:
+          1. image_id in sample metadata → lookup in _oracle_graph_index
+          2. oracle_graph field in sample → use directly (Member B embedded format)
+          3. Single oracle_graph_path → use for all samples (demo mode)
+        """
+        # Priority 1: index lookup by image_id
+        if hasattr(sample, "image_id") and sample.image_id:
+            image_id = sample.image_id
+            if image_id in self._oracle_graph_index:
+                return self._oracle_graph_index[image_id]
+
+        # Priority 2: embedded oracle_graph
+        if hasattr(sample, "oracle_graph") and sample.oracle_graph:
+            return sample.oracle_graph
+
+        # Priority 3: single global oracle
+        if self.oracle_graph_path and os.path.exists(self.oracle_graph_path):
+            with open(self.oracle_graph_path, "r", encoding="utf-8") as f:
+                return json.load(f).get("oracle_graph", {})
+
+        return None
 
     def _maybe_build_self_distillation_batch(
         self,
@@ -218,91 +275,51 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         verl's default implementation:
           - Checks if self_distillation config exists and loss_mode=="sdpo"
           - Collects solutions from successful samples (by uid grouping)
-          - Collects feedback from reward_extra_infos
-          - Builds a reprompted teacher batch with solution + feedback
-          - Returns (teacher_batch, metrics)
+          - Builds a reprompted teacher batch
 
         IsoGraph SDPO additions:
-          - Extracts/constructs DGR feedback from DummyEnvironment
-          - Computes IsoGraph token-level advantages via dual-role forward pass:
-              A_t = stop_gradient(log π_teacher) - log π_student
-          - Replaces verl's GRPO/GAE advantages with IsoGraph advantages
-          - Also supports the standard reprompted batch for warm-start
+          - Extracts/constructs DGR feedback from the VE-MDP environment
+          - Computes IsoGraph token-level advantages via dual-role forward pass
+          - Injects advantages directly into batch.batch["advantages"]
 
         The flow in ray_trainer.fit() after this call:
             self_distillation_batch, self_dist_metrics = _maybe_build_self_distillation_batch(...)
-            if self_distillation_data is not None:
-                batch = batch.union(self_distillation_batch)
-                metrics.update(self_dist_metrics)
-            # ...
-            batch = compute_advantage(batch, ...)    ← checks isograph_advantages_computed; skips GRPO
-            # ...
+            batch = compute_advantage(batch, ...)  ← reads isograph_advantages_computed; skips GRPO
             actor_output = self._update_actor(batch)  ← dp_actor uses teacher forward + IsoGraph loss
         """
-        # ------------------------------------------------------------------
-        # Defensive checks: fail fast if config is wrong
-        # ------------------------------------------------------------------
+        # IsoGraph SDPO core does NOT require use_kl_loss=true.
+        # When use_kl_loss=false, the reference model is NOT loaded (saves GPU memory).
+        # The IsoGraph SDPO advantage A_t = log π_teacher - log π_student is still computed.
+        # The KL penalty term -β·KL(π_θ||π_ref) is simply skipped (ref_log_probs=None
+        # is handled gracefully by compute_policy_loss_isograph at line 1318).
+        # This allows training on single-GPU machines with limited VRAM (e.g. 62 GB RTX A6000).
         use_kl_loss = self.config.actor_rollout_ref.actor.get("use_kl_loss", False)
         if not use_kl_loss:
-            raise ValueError(
-                f"[IsoGraph] FATAL: use_kl_loss is False. "
-                f"IsoGraph SDPO requires use_kl_loss=True so that ref_log_prob "
-                f"is available in dp_actor's micro-batch for the token-level "
-                f"KL penalty: L = ... - β·KL(π_θ || π_ref). "
-                f"Please set: actor_rollout_ref.actor.use_kl_loss=true"
+            print(
+                "[IsoGraph] WARNING: use_kl_loss=false. "
+                "Reference model will NOT be loaded (saves ~16 GB GPU memory). "
+                "KL penalty term (-β·KL) is skipped. "
+                "Training will use only the IsoGraph SDPO advantage (Teacher - Student)."
             )
 
-        # ------------------------------------------------------------------
-        # STEP A: Call parent's self-distillation logic (standard reprompt)
-        # This gives us the standard teacher batch with solution context.
-        # ------------------------------------------------------------------
-        parent_result = super()._maybe_build_self_distillation_batch(
-            batch, reward_tensor, reward_extra_infos_dict
-        )
-
-        # ------------------------------------------------------------------
-        # STEP B: Compute IsoGraph token-level advantages via dual-role pass
-        # This is the core SDPO advantage: A_t = log(π_teacher) - log(π_student)
-        # ------------------------------------------------------------------
+        # ---- Compute IsoGraph token-level advantages ----
         iso_metrics = self._compute_isograph_advantages(batch)
 
-        # ------------------------------------------------------------------
-        # STEP C: Get or build DGR feedback for self-distillation reprompt
-        # ------------------------------------------------------------------
+        # ---- Get DGR feedback from VE-MDP environment ----
         dgr_feedback = self._get_dgr_feedback(batch, reward_extra_infos_dict)
 
-        # ------------------------------------------------------------------
-        # STEP D: Build self-distillation batch with DGR context
-        # (augments parent's solution-based reprompt with DGR diagnostic text)
-        # ------------------------------------------------------------------
-        sd_batch, sd_metrics = self._build_isograph_teacher_batch(
-            batch, dgr_feedback
-        )
+        # ---- Build self-distillation batch with DGR context ----
+        sd_batch, sd_metrics = self._build_isograph_teacher_batch(batch, dgr_feedback)
 
-        # Merge metrics
         all_metrics = {**iso_metrics, **sd_metrics}
-        if parent_result is not None:
-            _, parent_metrics = parent_result
-            all_metrics.update({k: v for k, v in parent_metrics.items()
-                               if k not in all_metrics})
 
-        # =====================================================================
-        # CRITICAL: Inject IsoGraph advantages DIRECTLY into batch.batch["advantages"]
-        # so they are used by dp_actor.update_policy instead of GRPO advantages.
-        # This must happen AFTER _compute_isograph_advantages stores them.
-        # The ray_trainer.fit() calls compute_advantage() AFTER this method,
-        # but since we inject advantages here (BEFORE that call), the injection
-        # takes precedence. This is the correct fix for the dead-code problem
-        # where the local compute_advantage override in this file was never called.
-        # =====================================================================
+        # CRITICAL: Inject IsoGraph advantages so they take precedence over GRPO
         if "isograph_advantages" in batch.batch:
             batch.batch["advantages"] = batch.batch["isograph_advantages"]
             all_metrics["isograph/advantages_injected"] = True
 
         if sd_batch is not None:
             return sd_batch, all_metrics
-        elif parent_result is not None:
-            return parent_result
         return None
 
     def _compute_isograph_advantages(self, batch: DataProto) -> dict:
@@ -311,75 +328,52 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         Paper equation: A_t = stop_gradient(log π_θ') - log π_θ
 
-        This is called during the training loop to replace GRPO/GAE advantages
-        with IsoGraph's teacher-student log-prob difference.
-
-        In the current verl pipeline, this is called as part of
-        _maybe_build_self_distillation_batch BEFORE compute_advantage() runs.
-        We store the computed advantages in batch.batch so that later
-        compute_advantage() can use or skip them.
+        This is called as part of _maybe_build_self_distillation_batch BEFORE
+        compute_advantage() runs. We store the computed advantages in
+        batch.batch so that later compute_advantage() skips GRPO computation.
         """
         metrics = {}
 
-        # Defensive check: IsoGraph advantages are REQUIRED for IsoGraph SDPO.
-        # Raise immediately if the config is wrong, rather than silently computing wrong advantages.
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if loss_mode != "isograph":
             raise ValueError(
-                f"[IsoGraph] FATAL: loss_mode is '{loss_mode}' but IsoGraphRayPPOTrainer "
-                f"is active. IsoGraph SDPO requires loss_mode='isograph'. "
-                f"Please check your config: actor_rollout_ref.actor.policy_loss.loss_mode=isograph"
+                f"[IsoGraph] FATAL: loss_mode is '{loss_mode}' but "
+                f"IsoGraphRayPPOTrainer is active. "
+                f"Set: actor_rollout_ref.actor.policy_loss.loss_mode=isograph"
             )
 
         try:
-            # ------------------------------------------------------------------
-            # Extract tensors from batch
-            # ------------------------------------------------------------------
-            sequences = batch.batch["sequences"]          # [batch, total_len]
-            attention_mask = batch.batch["attention_mask"]  # [batch, total_len]
-            position_ids = batch.batch.get("position_ids")
-            if position_ids is None:
-                position_ids = compute_position_id_with_mask(attention_mask)
-
+            sequences = batch.batch["sequences"]
+            attention_mask = batch.batch["attention_mask"]
+            position_ids = batch.batch.get(
+                "position_ids",
+                compute_position_id_with_mask(attention_mask),
+            )
             response_mask = batch.batch.get("response_mask")
             if response_mask is None:
                 response_mask = compute_response_mask(batch)
 
-            old_log_probs = batch.batch.get("old_log_probs")  # [batch, resp_len]
-            ref_log_probs = batch.batch.get("ref_log_prob")   # [batch, resp_len]
-
+            old_log_probs = batch.batch.get("old_log_probs")
             if sequences is None or old_log_probs is None:
                 return metrics
 
-            # Estimate prompt length from sequences - attention_mask should help
-            # In verl, sequences = [prompt | response], response starts where mask becomes 1 after 0s
-            # Simple heuristic: find first non-pad token after prompt
             batch_size, total_len = sequences.shape
-            prompt_lengths = attention_mask.sum(dim=1).long()  # [batch]
-            response_lengths = (response_mask.sum(dim=1)).long()  # [batch]
+            prompt_lengths = attention_mask.sum(dim=1).long()
+            response_lengths = response_mask.sum(dim=1).long()
 
-            # ------------------------------------------------------------------
-            # Dual-role forward pass: Student (no_grad) + Self-Teacher (no_grad + DGR)
-            # ------------------------------------------------------------------
             actor_module = self.actor_rollout_wg._workers[0].module
             device = sequences.device
 
-            # For the dual-role pass, we use the actor model as both student and teacher
-            # The teacher would ideally be an EMA copy; for now we use the same model
-            # with no_grad to simulate the teacher (EMA update happens separately)
-
-            # Student forward pass (no gradients needed for this metric computation)
+            # Student forward pass (no_grad for metric computation)
             with torch.no_grad():
                 student_output = actor_module(
                     input_ids=sequences,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                 )
-                student_logits = student_output.logits  # [batch, total_len, vocab]
+                student_logits = student_output.logits
 
-                # Extract response logits for student
-                # response portion starts at prompt_length
-                prompt_len = prompt_lengths[0].item()  # assume same for all in batch
+                prompt_len = prompt_lengths[0].item()
                 resp_len = response_lengths[0].item()
 
                 student_resp_logits = student_logits[:, prompt_len - 1:prompt_len + resp_len - 1, :]
@@ -388,20 +382,11 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 student_log_probs = F.log_softmax(student_resp_logits, dim=-1)
                 student_log_probs = student_log_probs.gather(
                     -1, student_resp_ids.unsqueeze(-1)
-                ).squeeze(-1)  # [batch, resp_len]
+                ).squeeze(-1)
 
-                # Teacher forward pass (with DGR context if available)
-                # For now, teacher = student (EMA is updated in _update_actor)
-                teacher_log_probs = student_log_probs.detach()  # proxy: same as student
+                # Proxy: teacher = student (EMA updated in _update_actor)
+                teacher_log_probs = student_log_probs.detach()
 
-            # ------------------------------------------------------------------
-            # Store a marker so ray_trainer.compute_advantage() skips GRPO
-            # computation. The ACTUAL IsoGraph advantage A_t = teacher - student
-            # is computed INSIDE compute_policy_loss_isograph from the real
-            # teacher_log_probs (from dp_actor's dual-role forward pass), not
-            # from the proxy here. Storing zero here is harmless since it will
-            # be overwritten by compute_policy_loss_isograph.
-            # ------------------------------------------------------------------
             if "isograph_advantages" not in batch.batch:
                 batch.batch["isograph_advantages"] = torch.zeros_like(student_log_probs)
             batch.batch["isograph_advantages_computed"] = torch.tensor(True, device=device)
@@ -417,33 +402,65 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         reward_extra_infos_dict: Optional[dict] = None,
     ) -> list:
         """
-        Extract or generate DGR (Diagnostic Graph Report) feedback.
+        Generate DGR (Diagnostic Graph Report) feedback for each sample in batch.
 
-        In the full IsoGraph framework, this would:
-          1. Extract local graph G_l from the agent's trajectory
-          2. Compare G_l vs. oracle graph G_g via FGW optimal transport
-          3. Generate natural language diagnostic text f_DGR
+        Member C's IsoGraphEnvironment (or DummyEnvironment) runs FGW optimal
+        transport between the local graph Gl and the oracle graph Gg, then
+        produces a natural-language critique (the DGR).
 
-        In the current dummy implementation, we use DummyEnvironment which
-        returns predefined feedback strings.
+        For Member B data (data-B/page_*.json), each sample carries its own
+        oracle graph via image_id lookup or embedded oracle_graph field.
 
         Args:
             batch: Current training batch
-            reward_extra_infos_dict: Optional extra reward info from rollout
+            reward_extra_infos_dict: Extra reward info from rollout
 
         Returns:
-            List of DGR strings (one per sample in batch), or None
+            List of DGR strings (one per sample), or [None] * batch_size
         """
-        if self.dummy_env is None:
-            return [None] * len(batch.batch)
+        if self.isograph_env is None:
+            return [None] * (batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size")
+                             else batch.batch["sequences"].shape[0])
 
-        batch_size = batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size") else len(batch.batch["sequences"])
+        # Try to get sample-level oracle graphs from non_tensor_batch
+        oracle_graphs = []
+        if hasattr(batch, "non_tensor_batch"):
+            ntb = batch.non_tensor_batch
+            oracle_graphs = ntb.get("oracle_graphs", [])
+
+        batch_size = (
+            batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size")
+            else batch.batch["sequences"].shape[0]
+        )
         dgr_list = []
 
         try:
             for i in range(batch_size):
-                # Get DGR from DummyEnvironment
-                dgr = self.dummy_env.get_dgr_feedback()
+                # Resolve oracle graph for this sample
+                oracle_graph = None
+                if i < len(oracle_graphs) and oracle_graphs[i]:
+                    oracle_graph = oracle_graphs[i]
+                elif hasattr(batch, "non_tensor_batch"):
+                    # Try to look up by image_id
+                    ntb = batch.non_tensor_batch
+                    image_ids = ntb.get("image_ids", [])
+                    if i < len(image_ids) and image_ids[i] in self._oracle_graph_index:
+                        oracle_graph = self._oracle_graph_index[image_ids[i]]
+
+                # Load per-sample oracle into environment if available
+                if oracle_graph and hasattr(self.isograph_env, "oracle_graph"):
+                    # Temporarily set the per-sample oracle graph
+                    old_oracle = self.isograph_env.oracle_graph
+                    self.isograph_env.oracle_graph = oracle_graph
+                    if hasattr(self.isograph_env, "image_id"):
+                        img_ids = batch.non_tensor_batch.get("image_ids", []) if hasattr(batch, "non_tensor_batch") else []
+                        self.isograph_env.image_id = img_ids[i] if i < len(img_ids) else "sample"
+                    try:
+                        dgr = self.isograph_env.get_dgr_feedback()
+                    finally:
+                        self.isograph_env.oracle_graph = old_oracle
+                else:
+                    dgr = self.isograph_env.get_dgr_feedback()
                 dgr_list.append(dgr)
         except Exception as e:
             print(f"[IsoGraph] Warning: DGR feedback generation failed: {e}")
@@ -459,20 +476,8 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         """
         Build the self-distillation teacher batch for IsoGraph SDPO.
 
-        This builds per-sample DGR-prompted teacher inputs.
-
-        Teacher input structure: [DGR_prompt | response]  (same response tokens as student)
+        Teacher input structure: [DGR_prompt | response]
         Teacher attention mask: [1s for DGR_prompt | response_mask]
-
-        The teacher's prompt (DGR-enhanced) is prepended to the SAME response tokens
-        that the student generated. The response region is identified by response_mask
-        and is used by compute_self_distillation_loss to align student and teacher
-        logits (both use the same response tokens).
-
-        If the teacher prompt + response exceeds the maximum sequence length, the
-        prompt is truncated to leave room for the response. This mirrors the original
-        verl SDPO approach (teacher_prompt + responses → teacher_input_ids, with
-        teacher_prompt truncated via max_reprompt_len).
         """
         metrics = {}
         sd_batch = None
@@ -487,49 +492,50 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         try:
             device = batch.batch["input_ids"].device
-            # response_mask: [batch, max_seq_len] from IsoGraphRollout (full sequence mask)
             response_mask = batch.batch["response_mask"]
-            # responses: [batch, response_length] from IsoGraphRollout
             responses = batch.batch["responses"]
-            batch_size = batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size") else responses.shape[0]
-
-            # Get student sequence length (includes prompt + response)
-            student_seq_len = batch.batch["input_ids"].shape[1]  # max_seq_len
-            response_length = responses.shape[1]  # fixed across batch
-
-            # Collect feedback to build teacher batch
-            feedback_list = []
-            for i in range(batch_size):
-                fb = dgr_feedback[i] if i < len(dgr_feedback) else None
-                feedback_list.append(fb)
+            batch_size = (
+                batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size")
+                else responses.shape[0]
+            )
+            student_seq_len = batch.batch["input_ids"].shape[1]
+            response_length = responses.shape[1]
 
             # Filter to samples that have DGR feedback
-            num_with_feedback = sum(1 for fb in feedback_list if fb is not None)
-
+            num_with_feedback = sum(1 for fb in dgr_feedback if fb is not None)
             if num_with_feedback == 0:
                 return None, metrics
 
-            # Build teacher message with DGR context
-            feedback_template = getattr(self_distillation_cfg, "feedback_template",
-                                       "\n\n[Diagnostic Feedback]\n{fb}\n\n")
-            reprompt_template = getattr(self_distillation_cfg, "reprompt_template",
-                                       "{prompt}\n\n{feedback}")
+            feedback_template = getattr(
+                self_distillation_cfg, "feedback_template",
+                "\n\n[Diagnostic Feedback]\n{fb}\n\n"
+            )
+            reprompt_template = getattr(
+                self_distillation_cfg, "reprompt_template",
+                "{prompt}\n\n{feedback}"
+            )
 
             messages = []
             for i in range(batch_size):
-                if feedback_list[i] is None:
+                fb = dgr_feedback[i] if i < len(dgr_feedback) else None
+                if fb is None:
                     messages.append(None)
                     continue
 
-                fb_text = feedback_list[i]
-                feedback_section = feedback_template.format(fb=fb_text)
+                feedback_section = feedback_template.format(fb=fb)
 
-                # Get original prompt text
-                raw_prompt = batch.non_tensor_batch.get("raw_prompt", [[""] * batch_size])[i]
-                if isinstance(raw_prompt, list) and len(raw_prompt) > 0:
-                    prompt_text = raw_prompt[-1]["content"] if isinstance(raw_prompt[-1], dict) else str(raw_prompt[-1])
-                else:
-                    prompt_text = str(raw_prompt) if raw_prompt else ""
+                # Get original prompt text from non_tensor_batch
+                raw_prompt = [[""] * batch_size]
+                if hasattr(batch, "non_tensor_batch"):
+                    raw_prompt = batch.non_tensor_batch.get("raw_prompt", raw_prompt)
+                prompt_text = ""
+                if i < len(raw_prompt) and raw_prompt[i]:
+                    if isinstance(raw_prompt[i], list) and len(raw_prompt[i]) > 0:
+                        last_item = raw_prompt[i][-1]
+                        prompt_text = last_item.get("content", str(last_item)) \
+                            if isinstance(last_item, dict) else str(last_item)
+                    else:
+                        prompt_text = str(raw_prompt[i]) if raw_prompt[i] else ""
 
                 reprompt_text = reprompt_template.format(
                     prompt=prompt_text,
@@ -538,79 +544,76 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 )
                 messages.append(reprompt_text)
 
-            # Build teacher tensors for all samples
+            # Build teacher tensors
             teacher_input_ids_list = []
             teacher_attention_mask_list = []
             teacher_position_ids_list = []
             self_distillation_mask_list = []
 
             max_reprompt_len = getattr(self_distillation_cfg, "max_reprompt_len", 512)
-            # Reserve space for response in the teacher sequence
             teacher_prompt_max_len = max(1, max_reprompt_len - response_length)
             pad_token_id = self.tokenizer.pad_token_id or 0
 
             for i in range(batch_size):
                 if messages[i] is None:
-                    # No DGR feedback: use original student input as teacher input
-                    student_input = batch.batch["input_ids"][i]        # [student_seq_len]
-                    student_mask = batch.batch["attention_mask"][i]      # [student_seq_len]
-                    teacher_input = student_input
-                    teacher_mask = student_mask
-                    sd_mask_val = 0.0
-                else:
-                    # Encode the DGR-prompted message
-                    teacher_ids = self.tokenizer.encode(
-                        messages[i],
-                        add_special_tokens=True,
-                        truncation=True,
-                        max_length=teacher_prompt_max_len,
+                    student_input = batch.batch["input_ids"][i]
+                    student_mask = batch.batch["attention_mask"][i]
+                    teacher_input_ids_list.append(student_input.unsqueeze(0))
+                    teacher_attention_mask_list.append(student_mask.unsqueeze(0))
+                    teacher_position_ids_list.append(
+                        compute_position_id_with_mask(student_mask.unsqueeze(0))
                     )
-                    teacher_ids = torch.tensor(teacher_ids, dtype=torch.long, device=device)
+                    self_distillation_mask_list.append(0.0)
+                    continue
 
-                    # Build teacher input: [DGR_prompt | response]
-                    response_ids = responses[i]  # [response_length]
-                    # response_mask[i] is the full-sequence mask (1 for response tokens, 0 for prompt/padding)
-                    # Since teacher_input_len == student_seq_len and student_seq_len = prompt + response_length,
-                    # the last response_length positions correspond to the response
-                    if response_mask is not None:
-                        resp_valid_mask = response_mask[i, -response_length:]  # [response_length]
-                    else:
-                        resp_valid_mask = torch.ones(response_length, device=device, dtype=torch.long)
-                    teacher_input = torch.cat([teacher_ids, response_ids], dim=0)
+                # Encode DGR-prompted message
+                teacher_ids = self.tokenizer.encode(
+                    messages[i],
+                    add_special_tokens=True,
+                    truncation=True,
+                    max_length=teacher_prompt_max_len,
+                )
+                teacher_ids = torch.tensor(teacher_ids, dtype=torch.long, device=device)
+
+                # Teacher input: [DGR_prompt | response]
+                response_ids = responses[i]
+                resp_valid_mask = (
+                    response_mask[i, -response_length:]
+                    if response_mask is not None
+                    else torch.ones(response_length, device=device, dtype=torch.long)
+                )
+                teacher_input = torch.cat([teacher_ids, response_ids], dim=0)
+                teacher_mask = torch.cat([
+                    torch.ones_like(teacher_ids),
+                    resp_valid_mask,
+                ], dim=0)
+
+                # Pad to student_seq_len for alignment
+                teacher_input_len = teacher_input.shape[0]
+                if teacher_input_len < student_seq_len:
+                    pad_len = student_seq_len - teacher_input_len
+                    teacher_input = torch.cat([
+                        teacher_input,
+                        torch.full((pad_len,), pad_token_id, device=device, dtype=teacher_input.dtype)
+                    ])
                     teacher_mask = torch.cat([
-                        torch.ones_like(teacher_ids),  # DGR prompt: all valid
-                        resp_valid_mask,             # response: use response_mask
-                    ], dim=0)
-
-                    # Pad teacher_input to student_seq_len for alignment
-                    teacher_input_len = teacher_input.shape[0]
-                    if teacher_input_len < student_seq_len:
-                        teacher_input = torch.cat([
-                            teacher_input,
-                            torch.full((student_seq_len - teacher_input_len,), pad_token_id, device=device, dtype=teacher_input.dtype)
-                        ])
-                        teacher_mask = torch.cat([
-                            teacher_mask,
-                            torch.zeros(student_seq_len - teacher_mask.shape[0], device=device, dtype=teacher_mask.dtype)
-                        ])
-                    elif teacher_input_len > student_seq_len:
-                        # Truncate teacher input to student_seq_len (keep beginning of DGR prompt + response)
-                        teacher_input = teacher_input[:student_seq_len]
-                        teacher_mask = teacher_mask[:student_seq_len]
-
-                    sd_mask_val = 1.0
+                        teacher_mask,
+                        torch.zeros(pad_len, device=device, dtype=teacher_mask.dtype)
+                    ])
+                elif teacher_input_len > student_seq_len:
+                    teacher_input = teacher_input[:student_seq_len]
+                    teacher_mask = teacher_mask[:student_seq_len]
 
                 teacher_input_ids_list.append(teacher_input.unsqueeze(0))
                 teacher_attention_mask_list.append(teacher_mask.unsqueeze(0))
                 teacher_position_ids_list.append(
                     compute_position_id_with_mask(teacher_mask.unsqueeze(0))
                 )
-                self_distillation_mask_list.append(sd_mask_val)
+                self_distillation_mask_list.append(1.0)
 
-            # Concatenate all samples to form batch tensors
-            teacher_input_ids = torch.cat(teacher_input_ids_list, dim=0)          # [batch, student_seq_len]
-            teacher_attention_mask = torch.cat(teacher_attention_mask_list, dim=0)  # [batch, student_seq_len]
-            teacher_position_ids = torch.cat(teacher_position_ids_list, dim=0)  # [batch, student_seq_len]
+            teacher_input_ids = torch.cat(teacher_input_ids_list, dim=0)
+            teacher_attention_mask = torch.cat(teacher_attention_mask_list, dim=0)
+            teacher_position_ids = torch.cat(teacher_position_ids_list, dim=0)
             self_distillation_mask = torch.tensor(
                 self_distillation_mask_list,
                 dtype=torch.float32,
@@ -626,7 +629,6 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
             metrics["isograph/sd_batch_size"] = num_with_feedback
             metrics["isograph/sd_fraction"] = num_with_feedback / batch_size
-            metrics["isograph/feedback_samples"] = num_with_feedback
 
         except Exception as e:
             print(f"[IsoGraph] Warning: Teacher batch building failed: {e}")
@@ -635,20 +637,14 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         return sd_batch, metrics
 
     def _update_actor(self, batch: DataProto) -> DataProto:
-        """
-        Override actor update to include EMA teacher update.
-
-        After the standard PPO policy update, we update the EMA teacher model
-        for the next iteration's dual-role forward pass.
-        """
+        """Override actor update to include EMA teacher update."""
         actor_output = super()._update_actor(batch)
-
-        # Update EMA teacher after policy step
         self._update_ema_teacher()
 
-        # Log EMA update metrics
         if hasattr(actor_output, "meta_info") and "metrics" in actor_output.meta_info:
-            actor_output.meta_info["metrics"]["isograph/teacher_update_count"] = self.teacher_update_count
+            actor_output.meta_info["metrics"]["isograph/teacher_update_count"] = (
+                self.teacher_update_count
+            )
 
         return actor_output
 
@@ -657,28 +653,19 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         Update EMA teacher model (Self-Teacher for next iteration).
 
         θ_teacher ← decay * θ_teacher + (1 - decay) * θ_student
-
-        This is called after each policy update to maintain a stable
-        Self-Teacher for the next iteration's dual-role forward pass.
-
-        The EMA teacher is stored as `actor_worker._isograph_ema_teacher` and
-        wired to `actor_worker.teacher_module` so that `dp_actor._forward_micro_batch`
-        picks it up as the teacher model (teacher_model = self.teacher_module or self.actor_module).
-
-        IMPORTANT: We store on actor_worker (the DataParallelPPOActor inside the
-        WorkerDict), NOT on the trainer. The actor_worker's teacher_module is read
-        directly by dp_actor.update_policy at line ~820.
         """
         try:
             actor_worker = self.actor_rollout_wg._workers[0]
+
             if not hasattr(actor_worker, "_isograph_ema_teacher"):
-                # Create EMA teacher on first call
                 student_model = actor_worker.module
                 actor_worker._isograph_ema_teacher = deepcopy(student_model)
                 for p in actor_worker._isograph_ema_teacher.parameters():
                     p.requires_grad = False
                 actor_worker._isograph_ema_teacher.eval()
-                print(f"[IsoGraph] EMA teacher initialized with decay={self.isograph_config.ema_decay}")
+                print(
+                    f"[IsoGraph] EMA teacher initialized (decay={self.isograph_config.ema_decay})"
+                )
 
             ema_teacher = actor_worker._isograph_ema_teacher
             student_model = actor_worker.module
@@ -691,9 +678,7 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                 ):
                     t_param.data = decay * t_param.data + (1 - decay) * s_param.data
 
-            # CRITICAL: Wire EMA teacher to actor_worker's teacher_module.
-            # dp_actor._forward_micro_batch uses: teacher_model = self.teacher_module or self.actor_module.
-            # Without this assignment, self.teacher_module is None and the teacher = student (no distillation).
+            # Wire EMA teacher to actor_worker's teacher_module
             actor_worker.teacher_module = ema_teacher
 
             self.teacher_update_count += 1
@@ -703,7 +688,7 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
 
 # ============================================================================
-# STEP 6: Custom TaskRunner that uses IsoGraphRayPPOTrainer
+# STEP 5: Custom TaskRunner
 # ============================================================================
 
 def apply_kl_penalty(data: DataProto, kl_ctrl, kl_penalty="kl"):
@@ -712,17 +697,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl, kl_penalty="kl"):
     return _apply_kl_penalty(data, kl_ctrl, kl_penalty)
 
 
-# NOTE: The isograph advantages early-return check is now in
-# verl/trainer/ppo/ray_trainer.py:compute_advantage() (added there directly).
-# This avoids the dead-code problem of overriding compute_advantage as a
-# module-level function (which is never called — fit() calls the one from
-# ray_trainer.py directly). The check in ray_trainer.compute_advantage() reads
-# batch.batch["isograph_advantages_computed"] which is set by
-# IsoGraphRayPPOTrainer._maybe_build_self_distillation_batch().
-
-
 # ============================================================================
-# STEP 7: Main entry point (mirrors verl.trainer.main_ppo)
+# STEP 6: Hydra entry point
 # ============================================================================
 
 import hydra
@@ -736,12 +712,12 @@ from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
 class IsoGraphTaskRunner:
     """
-    Ray remote TaskRunner that creates IsoGraphRayPPOTrainer instead of RayPPOTrainer.
+    Ray remote TaskRunner that creates IsoGraphRayPPOTrainer.
 
-    This is the Ray-remote class that runs on a worker node. It sets up:
+    Sets up:
     1. Worker role mappings (ActorRollout, Critic, RefPolicy, RewardModel)
     2. Resource pools
-    3. Datasets (train + validation)
+    3. Datasets (train + validation) from Member B's data directory
     4. IsoGraphRayPPOTrainer with isograph_config
     5. Starts the training loop
     """
@@ -751,18 +727,15 @@ class IsoGraphTaskRunner:
         self.mapping = {}
 
     def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker. Same as TaskRunner but for IsoGraph."""
+        """Add actor rollout worker."""
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
 
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        use_legacy = config.trainer.get("use_legacy_worker_impl", "auto")
+        if use_legacy == "disable":
+            use_legacy = "enable"  # SDPO requires legacy implementation
 
-        # SDPO requires legacy worker implementation (teacher colocated with actor)
-        if use_legacy_worker_impl == "disable":
-            print("[IsoGraph] Overriding use_legacy_worker_impl=disable → enable for SDPO compatibility.")
-            use_legacy_worker_impl = "enable"
-
-        if use_legacy_worker_impl in ["auto", "enable"]:
+        if use_legacy in ["auto", "enable"]:
             if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
                 from verl.workers.fsdp_workers import AsyncActorRolloutRefWorker
                 actor_rollout_cls = AsyncActorRolloutRefWorker
@@ -772,10 +745,8 @@ class IsoGraphTaskRunner:
             else:
                 raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
         else:
-            raise NotImplementedError(f"use_legacy_worker_impl={use_legacy_worker_impl} not supported for SDPO")
+            raise NotImplementedError(f"use_legacy_worker_impl={use_legacy} not supported for SDPO")
 
-        # For SDPO, we need a separate ref policy for KL regularization
-        # (teacher is stored separately in _isograph_ema_teacher)
         actor_role = Role.ActorRolloutRef
         self.role_worker_mapping[actor_role] = ray.remote(actor_rollout_cls)
         self.mapping[actor_role] = "global_pool"
@@ -785,19 +756,15 @@ class IsoGraphTaskRunner:
         """Add critic worker."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-
         if config.critic.strategy in {"fsdp", "fsdp2"}:
-            if use_legacy_worker_impl in ["auto", "enable"]:
-                from verl.workers.fsdp_workers import CriticWorker
-            else:
-                raise NotImplementedError
+            from verl.workers.fsdp_workers import CriticWorker
+            self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
         elif config.critic.strategy == "megatron":
             from verl.workers.megatron_workers import CriticWorker
+            self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
         else:
             raise NotImplementedError
 
-        self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
         self.mapping[Role.Critic] = "global_pool"
 
     def add_reward_model_worker(self, config):
@@ -805,7 +772,6 @@ class IsoGraphTaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         if config.reward_model.enable:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if config.reward_model.strategy in {"fsdp", "fsdp2"}:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
@@ -814,41 +780,38 @@ class IsoGraphTaskRunner:
                 raise NotImplementedError
 
             self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            if config.reward_model.enable_resource_pool:
-                self.mapping[Role.RewardModel] = "reward_pool"
-            else:
-                self.mapping[Role.RewardModel] = "global_pool"
+            self.mapping[Role.RewardModel] = (
+                "reward_pool" if config.reward_model.enable_resource_pool else "global_pool"
+            )
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker for KL regularization."""
+        """Add reference policy worker."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        if use_legacy_worker_impl == "disable":
+        if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
             return
-
         if need_reference_policy(config):
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
-        global_pool_id = "global_pool"
         resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            "global_pool": [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
         if config.reward_model.enable_resource_pool:
-            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
-            resource_pool_spec["reward_pool"] = reward_pool
+            resource_pool_spec["reward_pool"] = (
+                [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
+            )
 
-        resource_pool_manager = ResourcePoolManager(
+        return ResourcePoolManager(
             resource_pool_spec=resource_pool_spec,
             mapping=self.mapping,
         )
-        return resource_pool_manager
 
     def run(self, config):
         """Execute IsoGraph SDPO training."""
+        import socket
         print(f"[IsoGraph] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
 
         from pprint import pprint as pp
@@ -858,9 +821,7 @@ class IsoGraphTaskRunner:
         OmegaConf.resolve(config)
         pp(OmegaConf.to_container(config, resolve=True))
 
-        # ------------------------------------------------------------------
-        # Worker setup (same as vanilla TaskRunner)
-        # ------------------------------------------------------------------
+        # Worker setup
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
         self.add_reward_model_worker(config)
@@ -872,9 +833,7 @@ class IsoGraphTaskRunner:
             use_critic=need_critic(config),
         )
 
-        # ------------------------------------------------------------------
         # Model & tokenizer
-        # ------------------------------------------------------------------
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path,
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),
@@ -886,9 +845,7 @@ class IsoGraphTaskRunner:
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
-        # ------------------------------------------------------------------
         # Reward manager
-        # ------------------------------------------------------------------
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
@@ -896,9 +853,7 @@ class IsoGraphTaskRunner:
             config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
 
-        # ------------------------------------------------------------------
         # Resource pool & datasets
-        # ------------------------------------------------------------------
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         train_dataset = create_rl_dataset(
@@ -919,9 +874,7 @@ class IsoGraphTaskRunner:
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
-        # ------------------------------------------------------------------
-        # Extract IsoGraph config from YAML
-        # ------------------------------------------------------------------
+        # Extract IsoGraph config
         isograph_cfg = config.actor_rollout_ref.actor.policy_loss.get("isograph", {})
         iso_sdpo_config = IsoGraphSDPOConfig(
             clip_ratio=isograph_cfg.get("clip_ratio", 0.2),
@@ -935,11 +888,18 @@ class IsoGraphTaskRunner:
             fgw_alpha=isograph_cfg.get("fgw_alpha", 0.5),
         )
 
-        oracle_graph_path = config.get("isograph", {}).get("oracle_graph_path", None)
+        # IsoGraph environment configuration
+        isograph_config = config.get("isograph", {})
+        oracle_graph_path = isograph_config.get("oracle_graph_path", None)
+        oracle_graph_dir = isograph_config.get("oracle_graph_dir", None)
+        use_dummy_env = isograph_config.get("use_dummy_env", True)
 
-        # ------------------------------------------------------------------
-        # Create IsoGraphRayPPOTrainer
-        # ------------------------------------------------------------------
+        print(
+            f"[IsoGraph] Config: oracle_graph_path={oracle_graph_path}, "
+            f"oracle_graph_dir={oracle_graph_dir}, use_dummy_env={use_dummy_env}"
+        )
+
+        # Create trainer
         trainer = IsoGraphRayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -955,21 +915,17 @@ class IsoGraphTaskRunner:
             train_sampler=train_sampler,
             isograph_config=iso_sdpo_config,
             oracle_graph_path=oracle_graph_path,
-            use_dummy_env=True,
+            oracle_graph_dir=oracle_graph_dir,
+            use_dummy_env=use_dummy_env,
         )
 
         trainer.init_workers()
         trainer.fit()
 
 
-# ============================================================================
-# STEP 8: Hydra entry point
-# ============================================================================
-
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    """Main entry point. Auto-detects CUDA/NPU device and runs training."""
-    from verl.utils.device import auto_set_device
+    """Main entry point."""
     auto_set_device(config)
     run_isograph_sdpo(config)
 

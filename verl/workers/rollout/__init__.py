@@ -16,9 +16,22 @@ from .base import BaseRollout, get_rollout_class
 from .hf_rollout import HFRollout
 from .naive import NaiveRollout
 
-# IsoGraph imports
-from .isograph_env import DummyEnvironment, VE_MDP_Environment, ActionResult, ActionType
-from .action_interceptor import ActionInterceptor, InterceptedTrajectory, TrajectoryStep, InterceptState
+# IsoGraph environment layer: auto-selects Member C's IsoGraphEnvironment
+# (production VE-MDP with FGW + DGR) or DummyEnvironment (pure Python fallback).
+# Exports DummyEnvironment as the stable type for type-checking.
+from .isograph_env import (
+    DummyEnvironment,
+    ActionResult,
+    ActionType,
+    get_environment_class,
+    create_environment,
+)
+from .action_interceptor import (
+    ActionInterceptor,
+    InterceptedTrajectory,
+    TrajectoryStep,
+    InterceptState,
+)
 from .isograph_rollout import IsoGraphRollout
 
 __all__ = [
@@ -28,9 +41,10 @@ __all__ = [
     "get_rollout_class",
     # IsoGraph components
     "DummyEnvironment",
-    "VE_MDP_Environment",
     "ActionResult",
     "ActionType",
+    "get_environment_class",
+    "create_environment",
     "ActionInterceptor",
     "InterceptedTrajectory",
     "TrajectoryStep",

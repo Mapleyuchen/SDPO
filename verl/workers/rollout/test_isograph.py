@@ -24,7 +24,7 @@ from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
 # Import IsoGraph components
-from verl.workers.rollout.isograph_env import DummyEnvironment, VE_MDP_Environment, ActionResult, ActionType
+from verl.workers.rollout.isograph_env import DummyEnvironment, ActionResult, ActionType
 from verl.workers.rollout.action_interceptor import ActionInterceptor, InterceptedTrajectory, TrajectoryStep
 from verl.workers.rollout.isograph_rollout import IsoGraphRollout
 
@@ -348,24 +348,31 @@ def test_env_action_types():
     return True
 
 
-def test_ve_mdp_environment():
-    """Test VE-MDP environment placeholder."""
+def test_env_factory():
+    """Test the environment factory (create_environment)."""
     print("=" * 60)
-    print("Testing VE-MDP Environment (Placeholder)")
+    print("Testing Environment Factory (create_environment)")
     print("=" * 60)
-    
-    ve_env = VE_MDP_Environment(image_path="dummy.jpg")
-    
-    # Test with action
-    action = "<call_svm>"
-    result = ve_env.step(action)
-    
-    print(f"VE-MDP Environment initialized")
-    print(f"Test action: {action}")
-    print(f"Result feedback: {result.feedback}")
-    print()
-    
-    print("✓ VE-MDP Environment placeholder test passed")
+
+    from verl.workers.rollout.isograph_env import create_environment, get_environment_class
+
+    env_cls = get_environment_class()
+    print(f"Active environment class: {env_cls.__name__}")
+
+    # Create environment
+    env = create_environment(
+        oracle_graph_path=None,
+        device="cpu",
+    )
+    print(f"Created environment: {type(env).__name__}")
+    print(f"  - oracle_graph loaded: {env.oracle_graph is not None}")
+    print(f"  - image_id: {env.image_id}")
+
+    # Test with a sample action
+    result = env.step("<zoom> [100, 200, 400, 350] </zoom>")
+    print(f"  - step() result type: {result.action_type}")
+
+    print("✓ Environment factory test passed")
     return True
 
 
@@ -379,10 +386,10 @@ def run_all_tests():
     tests = [
         test_dummy_environment,
         test_env_action_types,
+        test_env_factory,
         test_action_interceptor,
         test_trajectory_creation,
         test_isograph_rollout_config,
-        test_ve_mdp_environment,
     ]
     
     results = []
@@ -409,9 +416,9 @@ def run_all_tests():
     
     print()
     if passed == total:
-        print("All tests passed!")
+        print("🎉 All tests passed!")
     else:
-        print(f"{total - passed} test(s) failed")
+        print(f"⚠️  {total - passed} test(s) failed")
     
     return passed == total
 

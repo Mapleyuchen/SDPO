@@ -24,8 +24,12 @@ Key features:
 3. Appends environment feedback to context and resumes generation
 4. Collects complete trajectories with (state, action, env_feedback) alternation
 5. Computes log probabilities for all tokens including those generated after env feedback
+
+Environment: Automatically selects Member C's IsoGraphEnvironment (production VE-MDP)
+when available and isograph.use_dummy_env=false; otherwise uses DummyEnvironment.
 """
 
+import os
 import torch
 import torch.nn.functional as F
 from typing import Optional, List, Tuple, Dict, Any
@@ -41,7 +45,8 @@ from verl.workers.config import HFModelConfig
 
 from .base import BaseRollout
 from .action_interceptor import ActionInterceptor, InterceptedTrajectory
-from .isograph_env import DummyEnvironment
+# Use the factory: automatically picks Member C's IsoGraphEnvironment or DummyEnvironment
+from .isograph_env import create_environment, get_environment_class
 
 
 __all__ = ["IsoGraphRollout"]
@@ -53,18 +58,24 @@ class IsoGraphRolloutConfig:
     # Environment settings
     use_dummy_env: bool = True
     max_env_interactions: int = 10
-    
+    # Environment construction kwargs
+    oracle_graph_path: Optional[str] = None
+    image_path: Optional[str] = None
+    # Member C: SVM backend ("dummy" or "onnx")
+    svm_backend: str = "dummy"
+    svm_model_path: Optional[str] = None
+
     # Generation settings
     max_context_length: int = 4096
     temperature: float = 1.0
     top_k: Optional[int] = None
     top_p: float = 1.0
     do_sample: bool = True
-    
+
     # Trajectory collection
     collect_trajectory: bool = True
     collect_log_probs: bool = True
-    
+
     # Device
     device: str = "cuda"
 
@@ -105,22 +116,34 @@ class IsoGraphRollout(BaseRollout):
         tokenizer: Any = None,
         model_config: Any = None,
         device_mesh: Any = None,
-        environment: Optional[DummyEnvironment] = None,
+        environment: Optional[Any] = None,
+        use_dummy_env: Optional[bool] = None,
+        oracle_graph_path: Optional[str] = None,
+        image_path: Optional[str] = None,
+        svm_backend: str = "dummy",
+        svm_model_path: Optional[str] = None,
+        oracle_graph_dir: Optional[str] = None,
     ):
         """
         Initialize IsoGraph Rollout.
 
         Args:
             module: The MLLM module (must support HF-style forward)
-            config: Configuration object with rollout settings (RolloutConfig or dict)
-            tokenizer: HuggingFace tokenizer for tokenization (optional; lazy-loads from module if None)
+            config: Configuration object with rollout settings
+            tokenizer: HuggingFace tokenizer
             model_config: HFModelConfig (optional, for BaseRollout compatibility)
-            device_mesh: DeviceMesh (optional, for BaseRollout compatibility)
-            environment: Environment for action execution (DummyEnvironment or VE-MDP)
+            device_mesh: DeviceMesh (optional)
+            environment: Pre-constructed environment instance (overrides factory).
+                When provided, use_dummy_env / oracle_graph_path / svm_backend
+                are ignored.
+            use_dummy_env: Force DummyEnvironment (True) or Member C's IsoGraphEnvironment (False).
+                Defaults to config.isograph.use_dummy_env if available.
+            oracle_graph_path: Path to oracle graph JSON
+            image_path: Path to source image (Member C only)
+            svm_backend: "dummy" or "onnx" (Member C only)
+            svm_model_path: Path to ONNX SVM model (Member C only)
+            oracle_graph_dir: Directory containing page_*.json oracle graphs (Member B data)
         """
-        # Store attributes directly instead of calling BaseRollout.__init__
-        # (BaseRollout.__init__ requires config/model_config/device_mesh but
-        # HFRollout also bypasses it, so we follow the same pattern.)
         self.config = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = (
             omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
@@ -129,13 +152,40 @@ class IsoGraphRollout(BaseRollout):
         self.device_mesh = device_mesh
         self.module = module
         self.tokenizer = tokenizer
-        
-        # Create environment if not provided
-        if environment is None:
-            device = next(module.parameters()).device
-            self.environment = DummyEnvironment(device=str(device))
-        else:
+
+        # Determine whether to use DummyEnvironment or Member C's IsoGraphEnvironment
+        if environment is not None:
             self.environment = environment
+        elif use_dummy_env is True:
+            # Explicitly force DummyEnvironment
+            self.environment = create_environment(
+                oracle_graph_path=oracle_graph_path or self.config.get("oracle_graph_path"),
+                device=str(next(module.parameters()).device),
+            )
+        elif use_dummy_env is False:
+            # Explicitly force Member C's IsoGraphEnvironment
+            self.environment = create_environment(
+                oracle_graph_path=oracle_graph_path or self.config.get("oracle_graph_path"),
+                image_path=image_path or self.config.get("image_path"),
+                device=str(next(module.parameters()).device),
+                svm_backend=svm_backend,
+                svm_model_path=svm_model_path,
+            )
+        else:
+            # "auto": use config value or default to Member C if available
+            cfg_dummy = self.config.get("use_dummy_env", True)
+            self.environment = create_environment(
+                oracle_graph_path=oracle_graph_path or self.config.get("oracle_graph_path"),
+                image_path=image_path or self.config.get("image_path"),
+                device=str(next(module.parameters()).device),
+                svm_backend=svm_backend if not cfg_dummy else "dummy",
+                svm_model_path=svm_model_path,
+            )
+
+        print(
+            f"[IsoGraphRollout] Using environment: {type(self.environment).__name__} "
+            f"(oracle_graph_path={oracle_graph_path or self.config.get('oracle_graph_path')})"
+        )
         
         # Create action interceptor
         self.interceptor = ActionInterceptor(
@@ -366,9 +416,13 @@ class IsoGraphRollout(BaseRollout):
             batch_size=batch_size,
         )
         
-        # Store trajectories in non_tensor_batch for potential downstream use
+        # Store trajectories and per-sample oracle graphs in non_tensor_batch
+        # for downstream use by IsoGraphRayPPOTrainer._get_dgr_feedback()
         non_tensor_batch = {
             "trajectories": all_trajectories,
+            # Member B data: oracle graphs indexed by image_id
+            "oracle_graphs": getattr(prompts, "oracle_graphs", None) or [],
+            "image_ids": getattr(prompts, "image_ids", None) or [],
         }
         
         # Create output DataProto
@@ -454,10 +508,11 @@ class IsoGraphRollout(BaseRollout):
         
         return log_probs
     
-    def update_environment(self, environment: DummyEnvironment):
+    def update_environment(self, environment: Any):
         """Update the environment used for action execution."""
         self.environment = environment
         self.interceptor.environment = environment
+        print(f"[IsoGraphRollout] Environment updated to: {type(environment).__name__}")
     
     def get_trajectories(self, output: DataProto) -> List[InterceptedTrajectory]:
         """Extract trajectories from rollout output."""
