@@ -48,6 +48,13 @@
 
 set -xeuo pipefail
 
+# 【修改1：防强杀护盾】关闭 Ray 的内存监控强杀，保住系统 RAM 的命！
+export RAY_memory_usage_threshold=1.0
+export RAY_memory_monitor_refresh_ms=0
+
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export NCCL_P2P_DISABLE=1
+
 # =============================================================================
 # Default Configuration
 # =============================================================================
@@ -61,7 +68,7 @@ ROLLOUT_N="${ROLLOUT_N:-4}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 
 # Data (parquet files)
-DATA_DIR="${DATA_DIR:-}"
+DATA_DIR="${DATA_DIR:-/home/aisuan/SDPO/data}"
 
 # Resources
 N_GPUS="${N_GPUS:-1}"
@@ -75,9 +82,11 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen2_5_vl_7b_isograph}"
 USE_WANDB="${USE_WANDB:-false}"
 
 # IsoGraph environment configuration
-USE_DUMMY_ENV="${USE_DUMMY_ENV:-true}"
-ISOGRAPH_C_ROOT="${ISOGRAPH_C_ROOT:-}"
-ISOGRAPH_ORACLE_GRAPH_DIR="${ISOGRAPH_ORACLE_GRAPH_DIR:-}"
+USE_DUMMY_ENV="${USE_DUMMY_ENV:-false}"
+
+# 【修改2：Member C 路径】必须指向父目录 /home/aisuan，这样 Python 才能 import ISOGraph_C
+ISOGRAPH_C_ROOT="${ISOGRAPH_C_ROOT:-/home/aisuan}"
+ISOGRAPH_ORACLE_GRAPH_DIR="${ISOGRAPH_ORACLE_GRAPH_DIR:-/home/aisuan/data-B}"
 ORACLE_GRAPH_PATH="${ORACLE_GRAPH_PATH:-}"
 IMAGE_PATH="${IMAGE_PATH:-}"
 SVM_BACKEND="${SVM_BACKEND:-dummy}"
@@ -141,7 +150,6 @@ fi
 # =============================================================================
 
 if [ "$USE_DUMMY_ENV" = "false" ]; then
-    # Member C's real environment: need oracle graph
     if [ -n "$ISOGRAPH_ORACLE_GRAPH_DIR" ]; then
         echo "[INFO] Using Member B's oracle graph directory: ${ISOGRAPH_ORACLE_GRAPH_DIR}"
         ORACLE_GRAPH_ARG="isograph.oracle_graph_dir=${ISOGRAPH_ORACLE_GRAPH_DIR}"
@@ -168,17 +176,14 @@ fi
 
 if [ "$USE_DUMMY_ENV" = "false" ]; then
     if [ -z "$ISOGRAPH_C_ROOT" ]; then
-        # Try to find ISOGraph-C as a sibling directory
-        ISOGRAPH_C_ROOT="${SDPO_ROOT}/../ISOGraph-C"
+        ISOGRAPH_C_ROOT="${SDPO_ROOT}/../ISOGraph_C"
         if [ -d "$ISOGRAPH_C_ROOT" ]; then
-            echo "[INFO] Auto-detected ISOGraph-C at: ${ISOGRAPH_C_ROOT}"
+            echo "[INFO] Auto-detected ISOGraph_C at: ${ISOGRAPH_C_ROOT}"
         else
             echo "[WARNING] USE_DUMMY_ENV=false but ISOGRAPH_C_ROOT is not set."
-            echo "[WARNING] iso_graph_env will try pip-installed C.isograph_env_c."
-            echo "[WARNING] Set ISOGRAPH_C_ROOT=/path/to/ISOGraph-C to suppress this warning."
         fi
     else
-        echo "[INFO] Using ISOGraph-C from: ${ISOGRAPH_C_ROOT}"
+        echo "[INFO] Using ISOGraph_C from: ${ISOGRAPH_C_ROOT}"
     fi
 
     if [ -n "$ISOGRAPH_C_ROOT" ]; then
@@ -299,6 +304,11 @@ HYDRA_ARGS=(
     # Data
     data.train_files="${TRAIN_FILES}"
     data.val_files="${VAL_FILES}"
+    
+    # 扩大 Pipeline 管道
+    ++data.max_prompt_length=8192
+    ++data.max_response_length=2048
+    ++data.filter_overlong_prompts=false
 
     # IsoGraph environment
     isograph.use_dummy_env="${USE_DUMMY_ENV}"
@@ -323,6 +333,13 @@ HYDRA_ARGS=(
     actor_rollout_ref.actor.policy_loss.isograph.clip_ratio=0.2
 
     actor_rollout_ref.actor.strategy=fsdp2
+
+    # 【修改3：极限榨干显存的 4 板斧】防止单卡 VRAM 爆炸
+    ++actor_rollout_ref.model.enable_gradient_checkpointing=true
+    ++actor_rollout_ref.model.override_config.max_pixels=921600
+    ++actor_rollout_ref.model.target_modules="all-linear"
+    ++actor_rollout_ref.actor.ppo_max_token_len_per_gpu=2048
+    ++actor_rollout_ref.actor.ppo_mini_batch_size=16
 )
 
 # Conditionally add oracle graph path
