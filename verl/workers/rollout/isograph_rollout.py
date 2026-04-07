@@ -539,3 +539,27 @@ class IsoGraphRollout(BaseRollout):
             "min_tokens": min(total_tokens) if total_tokens else 0,
             "max_tokens": max(total_tokens) if total_tokens else 0,
         }
+    
+    def update_weights(self, weights: Any) -> None:
+        """
+        Update rollout weights from actor.
+        Since we are using colocated mode (single GPU), the weights are usually shared.
+        """
+        pass
+
+    def release(self) -> None:
+        """
+        Release resources to free up VRAM for actor training.
+        """
+        import gc
+        import torch
+        # Clean up temporary tensors and empty CUDA cache
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def resume(self) -> None:
+        """
+        Resume rollout (e.g., re-allocate KV cache buffers if they were released).
+        """
+        pass

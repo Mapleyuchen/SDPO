@@ -175,8 +175,6 @@ actor_rollout_ref:
   # Rollout configuration
   # --------------------------------------------------------------------------
   rollout:
-
-    use_isograph_rollout: true
     n: 4
     calculate_log_probs: true
     response_length: 512

@@ -310,18 +310,19 @@ HYDRA_ARGS=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.actor.use_torch_compile=false
     actor_rollout_ref.ref.use_torch_compile=false
-    actor_rollout_ref.actor.fsdp_config.param_offload=true
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=true
-    actor_rollout_ref.ref.fsdp_config.param_offload=true
-    actor_rollout_ref.ref.fsdp_config.optimizer_offload=true
+    actor_rollout_ref.actor.fsdp_config.param_offload=false
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false
+    actor_rollout_ref.ref.fsdp_config.param_offload=false
+    actor_rollout_ref.ref.fsdp_config.optimizer_offload=false
 
-    # Disable KL loss to skip loading ref model (saves ~16 GB GPU VRAM on single GPU)
     actor_rollout_ref.actor.use_kl_loss=false
 
     # IsoGraph SDPO hyperparameters
     actor_rollout_ref.actor.policy_loss.isograph.ema_decay=0.99
     actor_rollout_ref.actor.policy_loss.isograph.beta=0.01
     actor_rollout_ref.actor.policy_loss.isograph.clip_ratio=0.2
+
+    actor_rollout_ref.actor.strategy=fsdp2
 )
 
 # Conditionally add oracle graph path
