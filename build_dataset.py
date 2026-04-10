@@ -2,8 +2,11 @@ import os
 import json
 import pandas as pd
 
-DATA_B_DIR = "/home/aisuan/data-B"
-OUTPUT_DIR = "/home/aisuan/SDPO/data"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+
+DATA_B_DIR = os.environ.get("DATA_B_DIR", os.path.join(PROJECT_ROOT, "output"))
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(SCRIPT_DIR, "data"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -41,7 +44,10 @@ for filename in sorted(os.listdir(DATA_B_DIR)):
         row = {
             "prompt": json.dumps(prompt_msgs),  # verl 需要 stringified JSON
             "image_id": real_image_id,          # 传递给 Member C 环境的 ID
-            "reward_model": 1.0,                # RL 占位符
+            "reward_model": {
+                "style": "rule",
+                "ground_truth": json.dumps(graph_data),
+            },
         }
         data_rows.append(row)
 

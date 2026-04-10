@@ -813,9 +813,12 @@ class RayPPOTrainer:
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
 
-        # For agent loop, we need reward model keys to compute score.
+        # For agent loop / HF rollout, we need raw_prompt and reward model keys.
         if self.async_rollout_mode:
             gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+        else:
+            if "raw_prompt" in batch.non_tensor_batch:
+                gen_batch.non_tensor_batch["raw_prompt"] = batch.non_tensor_batch["raw_prompt"]
 
         return gen_batch
 

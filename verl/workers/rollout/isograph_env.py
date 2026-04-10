@@ -18,7 +18,10 @@ class ActionResult:
     feedback: str
     is_terminal: bool = False
 
-PARENT_DIR = "/home/aisuan"
+PARENT_DIR = os.environ.get(
+    "ISOGRAPH_C_ROOT",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")),
+)
 if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 

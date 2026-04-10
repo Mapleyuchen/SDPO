@@ -84,6 +84,18 @@ USE_WANDB="${USE_WANDB:-false}"
 # IsoGraph environment configuration
 USE_DUMMY_ENV="${USE_DUMMY_ENV:-false}"
 
+# Memory / offload configuration (configurable from outside)
+PARAM_OFFLOAD="${PARAM_OFFLOAD:-false}"
+OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-false}"
+USE_KL_LOSS="${USE_KL_LOSS:-false}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
+MAX_PIXELS="${MAX_PIXELS:-921600}"
+PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-2048}"
+PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-8192}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
+
 # 【修改2：Member C 路径】必须指向父目录 /home/aisuan，这样 Python 才能 import ISOGraph_C
 ISOGRAPH_C_ROOT="${ISOGRAPH_C_ROOT:-/home/aisuan}"
 ISOGRAPH_ORACLE_GRAPH_DIR="${ISOGRAPH_ORACLE_GRAPH_DIR:-/home/aisuan/data-B}"
@@ -114,7 +126,7 @@ else
 
     if [ ! -f "$TRAIN_FILES" ] || [ ! -f "$VAL_FILES" ]; then
         echo "[INFO] Generating dummy parquet files for pipeline testing..."
-        python -c "
+        python3 -c "
 import json
 import os
 import pandas as pd
@@ -304,11 +316,6 @@ HYDRA_ARGS=(
     # Data
     data.train_files="${TRAIN_FILES}"
     data.val_files="${VAL_FILES}"
-    
-    # 扩大 Pipeline 管道
-    ++data.max_prompt_length=8192
-    ++data.max_response_length=2048
-    ++data.filter_overlong_prompts=false
 
     # IsoGraph environment
     isograph.use_dummy_env="${USE_DUMMY_ENV}"
@@ -320,12 +327,14 @@ HYDRA_ARGS=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.actor.use_torch_compile=false
     actor_rollout_ref.ref.use_torch_compile=false
-    actor_rollout_ref.actor.fsdp_config.param_offload=false
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=false
-    actor_rollout_ref.ref.fsdp_config.param_offload=false
-    actor_rollout_ref.ref.fsdp_config.optimizer_offload=false
 
-    actor_rollout_ref.actor.use_kl_loss=false
+    # FSDP offload — controlled via env vars, not hardcoded
+    actor_rollout_ref.actor.fsdp_config.param_offload="${PARAM_OFFLOAD}"
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload="${OPTIMIZER_OFFLOAD}"
+    actor_rollout_ref.ref.fsdp_config.param_offload="${PARAM_OFFLOAD}"
+    actor_rollout_ref.ref.fsdp_config.optimizer_offload="${OPTIMIZER_OFFLOAD}"
+
+    actor_rollout_ref.actor.use_kl_loss="${USE_KL_LOSS}"
 
     # IsoGraph SDPO hyperparameters
     actor_rollout_ref.actor.policy_loss.isograph.ema_decay=0.99
@@ -334,12 +343,20 @@ HYDRA_ARGS=(
 
     actor_rollout_ref.actor.strategy=fsdp2
 
-    # 【修改3：极限榨干显存的 4 板斧】防止单卡 VRAM 爆炸
-    ++actor_rollout_ref.model.enable_gradient_checkpointing=true
-    ++actor_rollout_ref.model.override_config.max_pixels=921600
+    # Memory management — all configurable
+    ++actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}"
+    ++actor_rollout_ref.model.override_config.max_pixels="${MAX_PIXELS}"
     ++actor_rollout_ref.model.target_modules="all-linear"
-    ++actor_rollout_ref.actor.ppo_max_token_len_per_gpu=2048
-    ++actor_rollout_ref.actor.ppo_mini_batch_size=16
+    ++actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${PPO_MAX_TOKEN_LEN}"
+    ++actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}"
+
+    # Sequence lengths
+    ++data.max_prompt_length="${MAX_PROMPT_LENGTH}"
+    ++data.max_response_length="${MAX_RESPONSE_LENGTH}"
+    ++data.filter_overlong_prompts=false
+
+    # Batch size
+    data.train_batch_size="${TRAIN_BATCH_SIZE}"
 )
 
 # Conditionally add oracle graph path
@@ -362,7 +379,7 @@ if [ -n "$SVM_MODEL_PATH" ]; then
     HYDRA_ARGS+=(isograph.svm_model_path="${SVM_MODEL_PATH}")
 fi
 
-python -m verl.trainer.train_isograph_sdpo "${HYDRA_ARGS[@]}" "$@"
+python3 -m verl.trainer.train_isograph_sdpo "${HYDRA_ARGS[@]}" "$@"
 
 set +x
 

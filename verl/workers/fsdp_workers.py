@@ -1014,16 +1014,31 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         prompts.meta_info.update(meta_info)
 
         timing_generate = {}
+        from verl.workers.rollout.hf_rollout import HFRollout as _HFRollout
+        _skip_async = self.config.rollout.name == "hf" or isinstance(self.rollout, _HFRollout)
+        try:
+            from verl.workers.rollout.isograph_rollout import IsoGraphRollout as _IsoRollout
+            _skip_async = _skip_async or isinstance(self.rollout, _IsoRollout)
+        except ImportError:
+            pass
+
         if self._is_actor:  # For rollout only, we do not switch context.
-            loop = get_event_loop()
-            loop.run_until_complete(self.rollout_mode())
+            if _skip_async:
+                self.actor_module_fsdp.eval()
+            else:
+                loop = get_event_loop()
+                loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
         if self._is_actor:
-            loop.run_until_complete(self.trainer_mode())
+            if _skip_async:
+                self.actor_module_fsdp.train()
+                aggressive_empty_cache(force_sync=True)
+            else:
+                loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)
 
         # We calculate the average timing across all ranks

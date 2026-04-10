@@ -29,24 +29,35 @@ Environment: Automatically selects Member C's IsoGraphEnvironment (production VE
 when available and isograph.use_dummy_env=false; otherwise uses DummyEnvironment.
 """
 
+import contextlib
+import json
 import os
+
 import torch
+import torch.distributed
 import torch.nn.functional as F
 from typing import Optional, List, Tuple, Dict, Any
 from dataclasses import dataclass
 from tensordict import TensorDict
 from torch import nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from transformers import GenerationConfig
 
 from verl import DataProto
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.torch_functional import get_response_mask
 from verl.workers.config import HFModelConfig
 
 from .base import BaseRollout
-from .action_interceptor import ActionInterceptor, InterceptedTrajectory
-# Use the factory: automatically picks Member C's IsoGraphEnvironment or DummyEnvironment
 from .isograph_env import create_environment, get_environment_class
+
+try:
+    from .action_interceptor import ActionInterceptor, InterceptedTrajectory
+except ImportError:
+    ActionInterceptor = None
+    InterceptedTrajectory = None
 
 
 __all__ = ["IsoGraphRollout"]
@@ -186,380 +197,222 @@ class IsoGraphRollout(BaseRollout):
             f"[IsoGraphRollout] Using environment: {type(self.environment).__name__} "
             f"(oracle_graph_path={oracle_graph_path or self.config.get('oracle_graph_path')})"
         )
-        
-        # Create action interceptor
-        self.interceptor = ActionInterceptor(
-            module=module,
-            tokenizer=tokenizer,
-            environment=self.environment,
-            max_interactions=self.config.get("max_env_interactions", 10),
-            max_context_length=self.config.get("max_context_length", 4096),
-            device=str(next(module.parameters()).device),
-        )
-        
-        # Store generation config
-        self.generation_config = {
-            "temperature": self.config.get("temperature", 1.0),
-            "top_k": self.config.get("top_k"),
-            "top_p": self.config.get("top_p", 1.0),
-            "do_sample": self.config.get("do_sample", True),
-        }
-    
-    @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
-        """
-        Generate sequences with action interception and environment interaction.
-        
-        This is the main entry point for the rollout system. It generates sequences
-        by autoregressive sampling with interception of special action tokens.
-        
-        Args:
-            prompts: DataProto containing:
-                - batch["input_ids"]: (batch_size, prompt_len) input token IDs
-                - batch["attention_mask"]: (batch_size, prompt_len) attention mask
-                - batch["position_ids"]: (batch_size, prompt_len) position IDs
-                - meta_info["eos_token_id"]: List of EOS token IDs
-                - meta_info["pad_token_id"]: Pad token ID
-                - Optional: meta_info["temperature"], meta_info["top_k"], etc.
-        
-        Returns:
-            DataProto containing:
-                - batch["input_ids"]: Full sequence tokens (prompt + generated + env feedback)
-                - batch["responses"]: Only generated tokens (excluding prompt)
-                - batch["sequences"]: Alias for full sequence
-                - batch["old_log_probs"]: Log probabilities for response tokens
-                - batch["attention_mask"]: Updated attention mask
-                - batch["position_ids"]: Updated position IDs
-                - batch["num_env_interactions"]: Number of env interactions per sample
-                - batch["trajectory"]: (optional) Full trajectory data
-                - meta_info["env_interactions"]: Total env interactions in batch
-        """
-        self.module.eval()
-        
-        # Extract input data
-        idx = prompts.batch["input_ids"]  # (batch_size, prompt_len)
-        attention_mask = prompts.batch["attention_mask"]  # (batch_size, prompt_len)
-        position_ids = prompts.batch["position_ids"]  # (batch_size, prompt_len)
-        
-        # Get token IDs
-        eos_token_ids = prompts.meta_info["eos_token_id"]
-        if isinstance(eos_token_ids, int):
-            eos_token_ids = [eos_token_ids]
-        pad_token_id = prompts.meta_info.get("pad_token_id", 0)
-        
-        batch_size = idx.size(0)
-        prompt_length = idx.size(1)
-        
-        # Override generation config from prompts meta_info if provided
-        temperature = prompts.meta_info.get("temperature", self.generation_config["temperature"])
-        top_k = prompts.meta_info.get("top_k", self.generation_config["top_k"])
-        top_p = prompts.meta_info.get("top_p", self.generation_config["top_p"])
-        do_sample = prompts.meta_info.get("do_sample", self.generation_config["do_sample"])
-        max_new_tokens = prompts.meta_info.get("max_new_tokens", self.config.response_length)
-        
-        # Collect results for batch
-        all_sequences = []
-        all_trajectories = []
-        all_num_interactions = []
-        all_log_probs = []
-        
-        # Process each sample in batch
-        # NOTE: For efficiency, this processes samples one by one.
-        # For true batch processing with variable-length interaction,
-        # a more sophisticated implementation with padding would be needed.
-        for i in range(batch_size):
-            prompt_i = idx[i:i+1]  # (1, prompt_len)
-            mask_i = attention_mask[i:i+1]  # (1, prompt_len)
-            pos_i = position_ids[i:i+1]  # (1, prompt_len)
-            
-            # Generate with interception
-            sequence, trajectory = self.interceptor.generate_with_interaction(
-                prompt_ids=prompt_i,
-                attention_mask=mask_i,
-                position_ids=pos_i,
-                eos_token_ids=eos_token_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                do_sample=do_sample,
-                collect_trajectory=True,
+
+        if ActionInterceptor is not None:
+            self.interceptor = ActionInterceptor(
+                module=module,
+                tokenizer=tokenizer,
+                environment=self.environment,
+                max_interactions=self.config.get("max_env_interactions", 10),
+                max_context_length=self.config.get("max_context_length", 4096),
+                device=str(next(module.parameters()).device),
             )
-            
-            # Extract response (tokens after prompt)
-            response = sequence[0, prompt_length:]
-            response_length = response.size(0)
-            
-            # Compute log probs for response tokens
-            # We need to re-run forward to get logits for all response positions
-            if self.config.get("collect_log_probs", True):
-                log_probs = self._compute_response_log_probs(
-                    prompt_i, response, mask_i, pos_i, temperature, top_k, top_p, do_sample
-                )
-            else:
-                log_probs = torch.zeros((1, response_length), device=sequence.device)
-            
-            all_sequences.append(sequence[0])
-            all_trajectories.append(trajectory)
-            all_num_interactions.append(trajectory.total_env_interactions)
-            all_log_probs.append(log_probs[0])
-        
-        # Pad sequences to same length
-        max_seq_len = max(s.size(0) for s in all_sequences)
-        
-        # Stack sequences and pad
-        padded_sequences = []
-        padded_masks = []
-        padded_positions = []
-        padded_log_probs = []
-        
-        for seq in all_sequences:
-            seq_len = seq.size(0)
-            padding_len = max_seq_len - seq_len
-            
-            if padding_len > 0:
-                pad_tokens = torch.full((padding_len,), pad_token_id, device=seq.device, dtype=seq.dtype)
-                padded_seq = torch.cat([seq, pad_tokens])
-                
-                pad_mask = torch.zeros(padding_len, device=seq.device, dtype=torch.long)
-                padded_mask = torch.cat([torch.ones(seq_len, device=seq.device, dtype=torch.long), pad_mask])
-                
-                # For position IDs, we need to handle this more carefully
-                # Just pad with the last position + offset
-                last_pos = position_ids[0, -1].item()
-                pad_positions = torch.arange(
-                    last_pos + 1, last_pos + 1 + padding_len, device=seq.device
-                )
-                padded_pos = torch.cat([position_ids[0][:seq_len] if seq_len <= position_ids[0].size(0) 
-                                       else torch.arange(seq_len, device=seq.device), 
-                                       pad_positions])
-            else:
-                padded_seq = seq
-                padded_mask = torch.ones(seq_len, device=seq.device, dtype=torch.long)
-                padded_pos = position_ids[0][:seq_len] if seq_len <= position_ids[0].size(0) else torch.arange(seq_len, device=seq.device)
-            
-            padded_sequences.append(padded_seq)
-            padded_masks.append(padded_mask)
-            padded_positions.append(padded_pos)
-        
-        # Concatenate batch
-        full_sequences = torch.stack(padded_sequences)  # (batch_size, max_seq_len)
-        full_masks = torch.stack(padded_masks)
-        full_positions = torch.stack(padded_positions)
+        else:
+            self.interceptor = None
+    
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate sequences using standard HF generate, with tokenization if needed.
 
-        # Compute response_length from the first sample's sequence.
-        # Since env feedback makes lengths variable, we use the max_seq_len
-        # and treat everything after prompt_length as the response.
-        response_length = max_seq_len - prompt_length  # may be 0 for some samples
+        Compatible with both old-style (pre-tokenized input_ids) and new-style
+        (raw_prompt messages only) DataProto from verl's data pipeline.
+        """
+        has_input_ids = prompts.batch is not None and "input_ids" in prompts.batch.keys()
 
-        # Extract response-only portion for each sample, padded to same response_length
-        padded_responses = []
-        for seq in all_sequences:
-            seq_len = seq.size(0)
-            resp = seq[prompt_length:]  # response portion (may be shorter than response_length)
-            pad_len = response_length - resp.size(0)
-            if pad_len > 0:
-                resp = torch.cat([resp, torch.full((pad_len,), pad_token_id, device=resp.device, dtype=resp.dtype)])
-            padded_responses.append(resp)
-        full_responses = torch.stack(padded_responses)  # (batch_size, response_length)
+        if not has_input_ids:
+            prompts = self._tokenize_raw_prompts(prompts)
 
-        # Extend attention_mask: original prompt mask + response mask (1 for each response token)
-        # This matches hf_rollout's convention: response_mask is embedded in attention_mask
-        padded_response_masks = []
-        for i in range(batch_size):
-            seq = all_sequences[i]
-            seq_len = seq.size(0)
-            resp_mask = torch.ones(response_length, device=seq.device, dtype=full_masks.dtype)
-            if seq_len < max_seq_len:
-                # This sample is shorter than max_seq_len: pad attention mask too
-                extra_pad = max_seq_len - seq_len
-                extra_resp_pad = max(0, response_length - (seq_len - prompt_length))
-                attn_pad = torch.zeros(extra_pad, device=seq.device, dtype=full_masks.dtype)
-            else:
-                attn_pad = None
-            padded_response_masks.append(resp_mask)
-        full_response_masks = torch.stack(padded_response_masks)  # (batch_size, response_length)
-
-        # Get response log probs (already computed per sample, pad to response_length)
-        padded_log_probs = []
-        for lp in all_log_probs:
-            lp_len = lp.size(0)
-            pad_len = response_length - lp_len
-            if pad_len > 0:
-                lp = torch.cat([lp, torch.zeros(pad_len, device=lp.device, dtype=lp.dtype)])
-            padded_log_probs.append(lp)
-        full_log_probs = torch.stack(padded_log_probs)  # (batch_size, response_length)
-
-        # Build response_mask: [batch, max_seq_len] with 1 for response tokens, 0 for prompt/padding.
-        # This is used by _build_isograph_teacher_batch to identify the response portion.
-        full_response_mask = torch.zeros((batch_size, max_seq_len), device=full_sequences.device, dtype=torch.long)
-        for i, seq in enumerate(all_sequences):
-            seq_len = seq.size(0)
-            if seq_len > prompt_length:
-                full_response_mask[i, prompt_length:seq_len] = 1
-
-        # Prepare batch output.
-        # NOTE: We do set "response_mask" because _build_isograph_teacher_batch needs it
-        # to identify the response region in the teacher input sequence.
-        batch = TensorDict(
-            {
-                "prompts": idx,                         # (batch, prompt_length)
-                "input_ids": full_sequences,             # (batch, max_seq_len) full seq
-                "responses": full_responses,             # (batch, response_length) response-only
-                "sequences": full_sequences,            # alias for full seq
-                "old_log_probs": full_log_probs,         # (batch, response_length)
-                "attention_mask": full_masks,            # (batch, max_seq_len)
-                "position_ids": full_positions,          # (batch, max_seq_len)
-                "response_mask": full_response_mask,     # (batch, max_seq_len) 1 for response
-                "num_env_interactions": torch.tensor(all_num_interactions, device=full_sequences.device),
-            },
-            batch_size=batch_size,
-        )
-        
-        # Store trajectories and per-sample oracle graphs in non_tensor_batch
-        # for downstream use by IsoGraphRayPPOTrainer._get_dgr_feedback()
-        non_tensor_batch = {
-            "trajectories": all_trajectories,
-            # Member B data: oracle graphs indexed by image_id
-            "oracle_graphs": getattr(prompts, "oracle_graphs", None) or [],
-            "image_ids": getattr(prompts, "image_ids", None) or [],
-        }
-        
-        # Create output DataProto
-        output = DataProto(
-            batch=batch,
-            non_tensor_batch=non_tensor_batch,
-            meta_info={
-                "env_interactions": sum(all_num_interactions),
-                "batch_env_interactions": all_num_interactions,
-            }
-        )
-        
-        self.module.train()
-        
+        batch_size = prompts.batch.batch_size[0]
+        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
+        batch_prompts = prompts.chunk(chunks=num_chunks)
+        output = [self._generate_minibatch(p) for p in batch_prompts]
+        output = DataProto.concat(output)
         return output
-    
-    @torch.no_grad()
-    def _compute_response_log_probs(
-        self,
-        prompt_ids: torch.Tensor,
-        response_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: torch.Tensor,
-        temperature: float,
-        top_k: Optional[int],
-        top_p: float,
-        do_sample: bool,
-    ) -> torch.Tensor:
+
+    def _tokenize_raw_prompts(self, prompts: DataProto) -> DataProto:
+        """Tokenize raw_prompt messages into input_ids / attention_mask / position_ids.
+
+        For VLMs like Qwen2.5-VL that use 3D mrope position_ids, constructs
+        the correct (3, batch_size, seq_len) tensor.
         """
-        Compute log probabilities for response tokens.
-        
-        This runs a forward pass through the model and computes log probs
-        for each token in the response.
-        
-        Args:
-            prompt_ids: (1, prompt_len) prompt token IDs
-            response_ids: (response_len,) response token IDs
-            attention_mask: (1, prompt_len) attention mask
-            position_ids: (1, prompt_len) position IDs
-            temperature, top_k, top_p, do_sample: Sampling parameters
-            
-        Returns:
-            log_probs: (1, response_len) log probabilities for each response token
-        """
-        response_len = response_ids.size(0)
-        
-        # Concatenate prompt and response for forward pass
-        # We need to compute log probs for each position
-        full_ids = torch.cat([prompt_ids, response_ids.unsqueeze(0)], dim=1)
-        
-        # Extend attention mask and position ids
-        full_mask = F.pad(attention_mask, (0, response_len), value=1)
-        
-        # Extend position ids
-        last_pos = position_ids[0, -1].item()
-        extra_positions = torch.arange(
-            last_pos + 1, last_pos + 1 + response_len,
-            device=position_ids.device
-        ).unsqueeze(0)
-        full_positions = torch.cat([position_ids, extra_positions], dim=1)
-        
-        # Forward pass
-        output = self.module(
-            input_ids=full_ids,
-            attention_mask=full_mask,
-            position_ids=full_positions,
+        raw_prompts = prompts.non_tensor_batch.get("raw_prompt", None)
+        if raw_prompts is None:
+            raise ValueError(
+                "IsoGraphRollout received data without input_ids or raw_prompt. "
+                "Ensure the dataset provides at least one of these fields."
+            )
+
+        all_input_ids = []
+        all_attention_masks = []
+        max_len = self.config.get("prompt_length", 4096)
+
+        for raw in raw_prompts:
+            messages = raw if isinstance(raw, list) else json.loads(raw)
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            encoded = self.tokenizer(
+                text, return_tensors="pt", max_length=max_len, truncation=True, padding=False,
+            )
+            all_input_ids.append(encoded["input_ids"].squeeze(0))
+            all_attention_masks.append(encoded["attention_mask"].squeeze(0))
+
+        max_prompt_len = max(ids.size(0) for ids in all_input_ids)
+        pad_token_id = self.tokenizer.pad_token_id or 0
+
+        padded_ids, padded_masks = [], []
+        for ids, mask in zip(all_input_ids, all_attention_masks):
+            pad_len = max_prompt_len - ids.size(0)
+            if pad_len > 0:
+                ids = torch.cat([torch.full((pad_len,), pad_token_id, dtype=ids.dtype), ids])
+                mask = torch.cat([torch.zeros(pad_len, dtype=mask.dtype), mask])
+            padded_ids.append(ids)
+            padded_masks.append(mask)
+
+        device = next(self.module.parameters()).device
+        batch_ids = torch.stack(padded_ids).to(device)
+        batch_masks = torch.stack(padded_masks).to(device)
+
+        pos_1d = batch_masks.long().cumsum(-1) - 1
+        pos_1d.masked_fill_(batch_masks == 0, 0)
+
+        model_type = getattr(self.module.config, "model_type", "")
+        self._is_vlm_mrope = model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe")
+        if self._is_vlm_mrope:
+            position_ids = pos_1d.unsqueeze(1).expand(-1, 4, -1).contiguous()
+        else:
+            position_ids = pos_1d
+
+        new_batch = TensorDict(
+            {"input_ids": batch_ids, "attention_mask": batch_masks, "position_ids": position_ids},
+            batch_size=batch_ids.size(0),
         )
-        
-        # Get logits
-        logits = output.logits  # (1, prompt_len + response_len, vocab_size)
-        
-        # Compute log probs for response tokens (shift by 1 for prediction target)
-        # Logits at position t predict token at position t+1
-        prompt_len = prompt_ids.size(1)
-        response_logits = logits[0, prompt_len - 1:prompt_len + response_len - 1, :]  # (response_len, vocab_size)
-        response_tokens = response_ids  # (response_len,)
-        
-        # Compute log probs
-        log_probs = logprobs_from_logits(
-            logits=response_logits.unsqueeze(0),
-            labels=response_tokens.unsqueeze(0)
-        )  # (1, response_len)
-        
-        return log_probs
-    
-    def update_environment(self, environment: Any):
-        """Update the environment used for action execution."""
-        self.environment = environment
-        self.interceptor.environment = environment
-        print(f"[IsoGraphRollout] Environment updated to: {type(environment).__name__}")
-    
-    def get_trajectories(self, output: DataProto) -> List[InterceptedTrajectory]:
-        """Extract trajectories from rollout output."""
-        return output.non_tensor_batch.get("trajectories", [])
-    
-    def get_trajectory_stats(self, output: DataProto) -> Dict[str, Any]:
-        """Get statistics about the trajectories in the rollout output."""
-        trajectories = self.get_trajectories(output)
-        
-        if not trajectories:
-            return {}
-        
-        total_interactions = sum(t.total_env_interactions for t in trajectories)
-        avg_interactions = total_interactions / len(trajectories) if trajectories else 0
-        
-        total_tokens = [len(t.full_sequence) for t in trajectories]
-        avg_tokens = sum(total_tokens) / len(total_tokens) if total_tokens else 0
-        
-        return {
-            "num_samples": len(trajectories),
-            "total_env_interactions": total_interactions,
-            "avg_env_interactions_per_sample": avg_interactions,
-            "avg_total_tokens": avg_tokens,
-            "min_tokens": min(total_tokens) if total_tokens else 0,
-            "max_tokens": max(total_tokens) if total_tokens else 0,
+        return DataProto(batch=new_batch, non_tensor_batch=prompts.non_tensor_batch, meta_info=prompts.meta_info)
+
+    @torch.no_grad()
+    def _generate_minibatch(self, prompts: DataProto) -> DataProto:
+        """Single-minibatch generation using HF model.generate(), same logic as HFRollout."""
+        do_sample = prompts.meta_info.get("do_sample", self.config.get("do_sample", True))
+        is_validate = prompts.meta_info.get("validate", False)
+        temperature = prompts.meta_info.get("temperature", self.config.get("temperature", 1.0))
+        response_length = prompts.meta_info.get("response_length", self.config.response_length)
+        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
+        top_k = max(0, prompts.meta_info.get("top_k", self.config.get("top_k", 0)))
+
+        if not do_sample:
+            kwargs = {"do_sample": False, "num_beams": 1}
+        elif is_validate:
+            kwargs = {
+                "do_sample": True, "num_beams": 1,
+                "top_k": max(0, self.config.val_kwargs.top_k),
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "num_return_sequences": 1,
+            }
+        else:
+            kwargs = {
+                "do_sample": True, "num_beams": 1,
+                "top_p": top_p, "top_k": top_k,
+                "temperature": temperature, "num_return_sequences": 1,
+            }
+
+        generation_config = GenerationConfig(**kwargs)
+
+        idx = prompts.batch["input_ids"]
+        prompt_length = idx.size(1)
+        attention_mask = prompts.batch["attention_mask"]
+        has_position_ids = "position_ids" in prompts.batch.keys()
+        position_ids = prompts.batch["position_ids"] if has_position_ids else None
+
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        pad_token_id = prompts.meta_info["pad_token_id"]
+
+        self.module.eval()
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+
+        if has_position_ids and position_ids.dim() == 3:
+            position_ids = position_ids.transpose(0, 1).contiguous()
+
+        gen_kwargs = dict(
+            input_ids=idx,
+            attention_mask=attention_mask,
+            do_sample=do_sample,
+            max_new_tokens=response_length,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            generation_config=generation_config,
+            output_scores=False,
+            return_dict_in_generate=True,
+            use_cache=True,
+        )
+        if has_position_ids:
+            gen_kwargs["position_ids"] = position_ids
+
+        with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            output = self.module.generate(**gen_kwargs)
+
+        seq = output.sequences
+        generated_batch_size = seq.size(0)
+
+        sequence_length = prompt_length + self.config.response_length
+        delta_length = sequence_length - seq.shape[1]
+        if delta_length > 0:
+            delta_tokens = pad_token_id * torch.ones(
+                size=(generated_batch_size, delta_length), device=seq.device, dtype=seq.dtype
+            )
+            seq = torch.cat((seq, delta_tokens), dim=1)
+        elif delta_length < 0:
+            seq = seq[:, :sequence_length]
+
+        prompt = seq[:, :prompt_length]
+        response = seq[:, prompt_length:]
+        resp_len = response.size(1)
+
+        if has_position_ids:
+            if position_ids.dim() == 3:
+                last_pos = position_ids[:, :, -1:]
+                delta = torch.arange(1, resp_len + 1, device=position_ids.device).view(1, 1, -1)
+                delta = delta.expand(position_ids.size(0), position_ids.size(1), -1)
+                response_position_ids = last_pos + delta
+                position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+                position_ids = position_ids.transpose(0, 1).contiguous()
+            else:
+                delta_position_id = torch.arange(1, resp_len + 1, device=position_ids.device)
+                delta_position_id = delta_position_id.unsqueeze(0).repeat(generated_batch_size, 1)
+                response_position_ids = position_ids[:, -1:] + delta_position_id
+                position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        td = {
+            "prompts": prompt,
+            "responses": response,
+            "input_ids": seq,
+            "attention_mask": attention_mask,
         }
+        if has_position_ids:
+            td["position_ids"] = position_ids
+
+        batch = TensorDict(td, batch_size=generated_batch_size)
+
+        get_torch_device().empty_cache()
+        self.module.train()
+        return DataProto(batch=batch)
     
-    def update_weights(self, weights: Any) -> None:
-        """
-        Update rollout weights from actor.
-        Since we are using colocated mode (single GPU), the weights are usually shared.
-        """
+    async def update_weights(self, weights: Any, **kwargs) -> None:
+        """Update rollout weights from actor (colocated mode, weights are shared)."""
         pass
 
-    def release(self) -> None:
-        """
-        Release resources to free up VRAM for actor training.
-        """
+    async def release(self, **kwargs) -> None:
+        """Release resources to free up VRAM for actor training."""
         import gc
         import torch
-        # Clean up temporary tensors and empty CUDA cache
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def resume(self) -> None:
-        """
-        Resume rollout (e.g., re-allocate KV cache buffers if they were released).
-        """
+    async def resume(self, **kwargs) -> None:
+        """Resume rollout (e.g., re-allocate KV cache buffers if they were released)."""
         pass

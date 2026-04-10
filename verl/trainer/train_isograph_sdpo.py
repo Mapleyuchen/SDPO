@@ -194,6 +194,85 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         self.teacher_update_count = 0
         self.isograph_metrics: dict = defaultdict(list)
 
+    def init_workers(self):
+        """Override: run parent init but force sync mode for HF rollout."""
+        rollout_name = self.config.actor_rollout_ref.rollout.name
+        if rollout_name == "hf":
+            self._init_workers_sync()
+        else:
+            super().init_workers()
+
+    def _init_workers_sync(self):
+        """Full worker init copied from parent, but with async_rollout_mode=False."""
+        from verl.single_controller.ray.base import create_colocated_worker_cls
+        from verl.workers.config import FSDPEngineConfig
+
+        self.resource_pool_manager.create_resource_pool()
+        self.resource_pool_to_cls = {
+            pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()
+        }
+
+        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        if self.hybrid_engine:
+            resource_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+            actor_rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[actor_role],
+                config=self.config.actor_rollout_ref,
+                role=str(actor_role),
+            )
+            self.resource_pool_to_cls[resource_pool][str(actor_role)] = actor_rollout_cls
+        else:
+            raise NotImplementedError
+
+        if self.use_reference_policy and Role.RefPolicy in self.role_worker_mapping:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.RefPolicy),
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+
+        if self.use_rm:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
+
+        all_wg = {}
+        wg_kwargs = {"device_name": self.device_name}
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            if str(Role.RefPolicy) in all_wg:
+                self.ref_policy_wg = all_wg[str(Role.RefPolicy)]
+                self.ref_policy_wg.init_model()
+            else:
+                self.ref_policy_wg = all_wg[str(Role.ActorRolloutRef)]
+
+        self.rm_wg = None
+        if self.use_rm:
+            self.rm_wg = all_wg[str(Role.RewardModel)]
+            self.rm_wg.init_model()
+
+        self.actor_rollout_wg = all_wg[str(actor_role)]
+        self.actor_rollout_wg.init_model()
+
+        if self.ref_in_actor:
+            self.ref_policy_wg = self.actor_rollout_wg
+
+        self.async_rollout_mode = False
+        print("[IsoGraph] HF rollout: using sync mode (AgentLoopManager skipped)")
+
     def _default_oracle_path(self) -> str:
         """Return a default oracle graph path."""
         return os.path.join(SDPO_ROOT, "global_oracle_graph_demo.json")
@@ -934,6 +1013,15 @@ def run_isograph_sdpo(config, task_runner_class=None):
     """Initialize Ray and run IsoGraph SDPO training."""
     if not ray.is_initialized():
         default_runtime_env = get_ppo_ray_runtime_env()
+
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        if pythonpath:
+            default_runtime_env.setdefault("env_vars", {})["PYTHONPATH"] = pythonpath
+
+        isograph_c_root = os.environ.get("ISOGRAPH_C_ROOT", "")
+        if isograph_c_root:
+            default_runtime_env["env_vars"]["ISOGRAPH_C_ROOT"] = isograph_c_root
+
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
