@@ -211,7 +211,7 @@ fi
 if command -v nvidia-smi &> /dev/null; then
     ACCELERATOR="cuda"
     echo "[INFO] Detected CUDA GPUs:"
-    nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader 2>/dev/null | head -n ${N_GPUS}
+    nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader 2>/dev/null | head -n ${N_GPUS} || true
 elif [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
     ACCELERATOR="npu"
     echo "[INFO] Detected NPU (Ascend)."
@@ -299,7 +299,7 @@ HYDRA_ARGS=(
 
     # Model
     actor_rollout_ref.model.path="${MODEL_NAME}"
-    +actor_rollout_ref.model.override_config.attn_implementation="sdpa"
+    +actor_rollout_ref.model.override_config.attn_implementation="flash_attention_2"
 
     # Training
     actor_rollout_ref.actor.optim.lr="${LR}"

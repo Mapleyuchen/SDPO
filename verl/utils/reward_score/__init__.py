@@ -103,6 +103,11 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source == "isograph":
+        # ISOGraph: scalar reward is a placeholder; real feedback comes from FGW/DGR in the SDPO loop.
+        # ground_truth contains the oracle graph JSON. For now return 0.0.
+        res = 0.0
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

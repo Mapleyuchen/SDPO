@@ -399,17 +399,39 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         if sd_batch is not None:
             return sd_batch, all_metrics
-        return None
+
+        # When no DGR feedback is available, create dummy teacher tensors
+        # (copy of student with self_distillation_mask=0) to satisfy dp_actor assertions.
+        device = batch.batch["input_ids"].device
+        if "position_ids" in batch.batch and batch.batch["position_ids"].dim() == 3:
+            teacher_pos_ids = batch.batch["position_ids"].clone()
+        else:
+            # Create 3D mrope-format position_ids from attention_mask
+            pos_1d = compute_position_id_with_mask(batch.batch["attention_mask"])
+            teacher_pos_ids = pos_1d.unsqueeze(1).expand(-1, 4, -1)
+        dummy_sd = DataProto.from_dict(tensors={
+            "teacher_input_ids": batch.batch["input_ids"].clone(),
+            "teacher_attention_mask": batch.batch["attention_mask"].clone(),
+            "teacher_position_ids": teacher_pos_ids,
+            "self_distillation_mask": torch.zeros(batch.batch["input_ids"].shape[0], device=device),
+        })
+        return dummy_sd, all_metrics
 
     def _compute_isograph_advantages(self, batch: DataProto) -> dict:
         """
-        Compute IsoGraph token-level advantages using the dual-role forward pass.
+        Set up IsoGraph advantages placeholder for the SDPO loss computation.
 
-        Paper equation: A_t = stop_gradient(log π_θ') - log π_θ
+        In IsoGraph SDPO, the true token-level advantages are computed inside
+        ``compute_policy_loss_isograph`` (dp_actor.py) via the dual forward
+        pass: student on original input, teacher on DGR-augmented input.
 
-        This is called as part of _maybe_build_self_distillation_batch BEFORE
-        compute_advantage() runs. We store the computed advantages in
-        batch.batch so that later compute_advantage() skips GRPO computation.
+        Here we just:
+          1. Verify loss_mode == "isograph"
+          2. Initialize ``batch.batch["isograph_advantages"]`` as zeros
+          3. Set the flag so ``compute_advantage()`` skips GRPO
+
+        The real advantage A_t = log π_teacher(a|s,DGR) - log π_student(a|s)
+        is computed inside the SDPO loss function itself.
         """
         metrics = {}
 
@@ -423,55 +445,24 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
 
         try:
             sequences = batch.batch["sequences"]
-            attention_mask = batch.batch["attention_mask"]
-            position_ids = batch.batch.get(
-                "position_ids",
-                compute_position_id_with_mask(attention_mask),
-            )
             response_mask = batch.batch.get("response_mask")
             if response_mask is None:
                 response_mask = compute_response_mask(batch)
 
-            old_log_probs = batch.batch.get("old_log_probs")
-            if sequences is None or old_log_probs is None:
-                return metrics
-
-            batch_size, total_len = sequences.shape
-            prompt_lengths = attention_mask.sum(dim=1).long()
-            response_lengths = response_mask.sum(dim=1).long()
-
-            actor_module = self.actor_rollout_wg._workers[0].module
             device = sequences.device
+            batch_size = sequences.shape[0]
+            resp_len = response_mask.shape[1] if response_mask is not None else 1
 
-            # Student forward pass (no_grad for metric computation)
-            with torch.no_grad():
-                student_output = actor_module(
-                    input_ids=sequences,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                )
-                student_logits = student_output.logits
-
-                prompt_len = prompt_lengths[0].item()
-                resp_len = response_lengths[0].item()
-
-                student_resp_logits = student_logits[:, prompt_len - 1:prompt_len + resp_len - 1, :]
-                student_resp_ids = sequences[:, prompt_len:prompt_len + resp_len]
-
-                student_log_probs = F.log_softmax(student_resp_logits, dim=-1)
-                student_log_probs = student_log_probs.gather(
-                    -1, student_resp_ids.unsqueeze(-1)
-                ).squeeze(-1)
-
-                # Proxy: teacher = student (EMA updated in _update_actor)
-                teacher_log_probs = student_log_probs.detach()
-
+            # Initialize zero advantages (real computation in dp_actor SDPO loss)
             if "isograph_advantages" not in batch.batch:
-                batch.batch["isograph_advantages"] = torch.zeros_like(student_log_probs)
+                batch.batch["isograph_advantages"] = torch.zeros(
+                    batch_size, resp_len, device=device
+                )
             batch.batch["isograph_advantages_computed"] = torch.tensor(True, device=device)
 
         except Exception as e:
             metrics["isograph/adv_error"] = str(e)
+            print(f"[IsoGraph] Warning: advantage setup failed: {e}")
 
         return metrics
 
@@ -483,69 +474,184 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
         """
         Generate DGR (Diagnostic Graph Report) feedback for each sample in batch.
 
-        Member C's IsoGraphEnvironment (or DummyEnvironment) runs FGW optimal
-        transport between the local graph Gl and the oracle graph Gg, then
-        produces a natural-language critique (the DGR).
+        Member C's IsoGraphEnvironment runs FGW optimal transport between
+        the model's predicted local graph (parsed from its text response)
+        and the oracle graph, then produces a natural-language critique (DGR).
 
-        For Member B data (data-B/page_*.json), each sample carries its own
-        oracle graph via image_id lookup or embedded oracle_graph field.
+        Oracle graph resolution priority:
+          1. ``_oracle_graph_index[image_id]``  (loaded from oracle_graph_dir)
+          2. ``reward_model.ground_truth`` embedded in parquet
+          3. ``self.isograph_env.oracle_graph`` (global fallback)
 
         Args:
             batch: Current training batch
             reward_extra_infos_dict: Extra reward info from rollout
 
         Returns:
-            List of DGR strings (one per sample), or [None] * batch_size
+            List of DGR strings (one per sample). Never returns None entries
+            when the environment is available — worst case returns a DGR
+            describing a fully-missing prediction.
         """
-        if self.isograph_env is None:
-            return [None] * (batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size")
-                             else batch.batch["sequences"].shape[0])
-
-        # Try to get sample-level oracle graphs from non_tensor_batch
-        oracle_graphs = []
-        if hasattr(batch, "non_tensor_batch"):
-            ntb = batch.non_tensor_batch
-            oracle_graphs = ntb.get("oracle_graphs", [])
-
         batch_size = (
             batch.batch.batch_size[0] if hasattr(batch.batch, "batch_size")
             else batch.batch["sequences"].shape[0]
         )
+
+        if self.isograph_env is None:
+            return [None] * batch_size
+
+        # ---- Decode model responses ----
+        response_texts = self._decode_responses(batch)
+
+        # ---- Resolve per-sample oracle graphs ----
+        ntb = batch.non_tensor_batch if hasattr(batch, "non_tensor_batch") else {}
+
+        # Debug: print available keys once
+        if not hasattr(self, "_dgr_debug_printed"):
+            self._dgr_debug_printed = True
+            print(f"[IsoGraph DEBUG] non_tensor_batch keys: {list(ntb.keys()) if ntb else 'NONE'}")
+            if ntb:
+                for k in list(ntb.keys())[:6]:
+                    v = ntb[k]
+                    if isinstance(v, (list, tuple)):
+                        sample = v[0] if len(v) > 0 else "EMPTY"
+                        print(f"  {k}: type={type(v).__name__}, len={len(v)}, sample[0] type={type(sample).__name__}, val={str(sample)[:120]}")
+                    elif hasattr(v, '__len__'):
+                        sample = v[0] if len(v) > 0 else "EMPTY"
+                        print(f"  {k}: type={type(v).__name__}, len={len(v)}, sample[0] type={type(sample).__name__}, val={str(sample)[:120]}")
+                    else:
+                        print(f"  {k}: type={type(v).__name__}, value={str(v)[:120]}")
+
+        # image_id is NOT in non_tensor_batch (verl doesn't propagate custom columns)
+        # We extract it from reward_model.ground_truth instead
+        image_ids = []
+
+        # reward_model column contains ground_truth
+        reward_models_raw = ntb.get("reward_model", [])
+        # May be numpy array, list, or single value
+        if hasattr(reward_models_raw, 'tolist'):
+            reward_models = reward_models_raw.tolist()
+        elif isinstance(reward_models_raw, (list, tuple)):
+            reward_models = list(reward_models_raw)
+        else:
+            reward_models = [reward_models_raw] * batch_size
+
+        # Pre-parse oracle graphs and extract image_ids
+        oracle_graphs_cache = []
+        scenarios_cache = []
+        for rm in reward_models:
+            og = None
+            iid = None
+            scenario = None
+            if isinstance(rm, dict):
+                gt_raw = rm.get("ground_truth")
+                if gt_raw:
+                    try:
+                        gt_data = json.loads(gt_raw) if isinstance(gt_raw, str) else gt_raw
+                        og = gt_data.get("oracle_graph", gt_data)
+                        iid = gt_data.get("image_id")
+                        scenario = gt_data.get("adversarial_scenario") or gt_data.get("hallucination_type")
+                    except (json.JSONDecodeError, TypeError, AttributeError):
+                        pass
+            oracle_graphs_cache.append(og)
+            image_ids.append(iid)
+            scenarios_cache.append(scenario)
+
         dgr_list = []
 
-        try:
-            for i in range(batch_size):
-                # Resolve oracle graph for this sample
+        for i in range(batch_size):
+            try:
+                # ---- Resolve oracle graph for this sample ----
                 oracle_graph = None
-                if i < len(oracle_graphs) and oracle_graphs[i]:
-                    oracle_graph = oracle_graphs[i]
-                elif hasattr(batch, "non_tensor_batch"):
-                    # Try to look up by image_id
-                    ntb = batch.non_tensor_batch
-                    image_ids = ntb.get("image_ids", [])
-                    if i < len(image_ids) and image_ids[i] in self._oracle_graph_index:
-                        oracle_graph = self._oracle_graph_index[image_ids[i]]
 
-                # Load per-sample oracle into environment if available
-                if oracle_graph and hasattr(self.isograph_env, "oracle_graph"):
-                    # Temporarily set the per-sample oracle graph
-                    old_oracle = self.isograph_env.oracle_graph
-                    self.isograph_env.oracle_graph = oracle_graph
-                    if hasattr(self.isograph_env, "image_id"):
-                        img_ids = batch.non_tensor_batch.get("image_ids", []) if hasattr(batch, "non_tensor_batch") else []
-                        self.isograph_env.image_id = img_ids[i] if i < len(img_ids) else "sample"
-                    try:
-                        dgr = self.isograph_env.get_dgr_feedback()
-                    finally:
-                        self.isograph_env.oracle_graph = old_oracle
-                else:
-                    dgr = self.isograph_env.get_dgr_feedback()
+                # Priority 1: index lookup by image_id (extracted from ground_truth)
+                iid = image_ids[i] if i < len(image_ids) else None
+                if iid and iid in self._oracle_graph_index:
+                    oracle_graph = self._oracle_graph_index[iid]
+
+                # Priority 2: use cached oracle from reward_model.ground_truth
+                if oracle_graph is None and i < len(oracle_graphs_cache):
+                    oracle_graph = oracle_graphs_cache[i]
+
+                # ---- Get response text ----
+                resp_text = response_texts[i] if i < len(response_texts) else ""
+
+                # ---- Get image_id and scenario for DGR report ----
+                img_id = image_ids[i] if i < len(image_ids) else "sample"
+                scenario = scenarios_cache[i] if i < len(scenarios_cache) else None
+
+                # ---- Call Member C's convenience method ----
+                dgr = self.isograph_env.get_dgr_feedback_for_response(
+                    response_text=resp_text,
+                    oracle_graph=oracle_graph,
+                    image_id=img_id,
+                    scenario=scenario,
+                )
                 dgr_list.append(dgr)
-        except Exception as e:
-            print(f"[IsoGraph] Warning: DGR feedback generation failed: {e}")
-            dgr_list = [None] * batch_size
+
+            except Exception as e:
+                print(f"[IsoGraph] Warning: DGR feedback generation failed for sample {i}: {e}")
+                dgr_list.append(None)
+
+        num_valid = sum(1 for d in dgr_list if d is not None)
+        if num_valid > 0:
+            # Print first DGR for monitoring
+            first_valid = next(d for d in dgr_list if d is not None)
+            preview = first_valid[:200].replace("\n", " ")
+            print(f"[IsoGraph] DGR feedback: {num_valid}/{batch_size} samples. "
+                  f"Preview: {preview}...")
 
         return dgr_list
+
+    def _decode_responses(self, batch: DataProto) -> list[str]:
+        """Decode model response tokens back to text strings.
+
+        Uses ``batch.batch["responses"]`` if available (padded response-only
+        tokens), otherwise extracts the response portion from
+        ``batch.batch["sequences"]`` using ``attention_mask``.
+        """
+        try:
+            if "responses" in batch.batch:
+                response_ids = batch.batch["responses"]
+            elif "sequences" in batch.batch and "attention_mask" in batch.batch:
+                sequences = batch.batch["sequences"]
+                attention_mask = batch.batch["attention_mask"]
+                # Response starts where prompt ends
+                prompt_lens = attention_mask.sum(dim=1).long()
+                # Get response portion
+                response_ids = []
+                for idx in range(sequences.shape[0]):
+                    pl = prompt_lens[idx].item()
+                    resp = sequences[idx, pl:]
+                    response_ids.append(resp)
+                # Pad to same length
+                max_len = max(r.shape[0] for r in response_ids)
+                pad_id = self.tokenizer.pad_token_id or 0
+                padded = torch.full((len(response_ids), max_len), pad_id,
+                                    dtype=torch.long, device=sequences.device)
+                for idx, r in enumerate(response_ids):
+                    padded[idx, :r.shape[0]] = r
+                response_ids = padded
+            else:
+                return [""] * (batch.batch["input_ids"].shape[0]
+                               if "input_ids" in batch.batch else 1)
+
+            texts = []
+            for idx in range(response_ids.shape[0]):
+                tokens = response_ids[idx]
+                # Remove padding
+                if self.tokenizer.pad_token_id is not None:
+                    tokens = tokens[tokens != self.tokenizer.pad_token_id]
+                # Remove EOS
+                if self.tokenizer.eos_token_id is not None:
+                    tokens = tokens[tokens != self.tokenizer.eos_token_id]
+                text = self.tokenizer.decode(tokens, skip_special_tokens=True)
+                texts.append(text)
+            return texts
+        except Exception as e:
+            print(f"[IsoGraph] Warning: Response decoding failed: {e}")
+            bs = batch.batch["sequences"].shape[0] if "sequences" in batch.batch else 1
+            return [""] * bs
 
     def _build_isograph_teacher_batch(
         self,
@@ -601,7 +707,11 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                     messages.append(None)
                     continue
 
-                feedback_section = feedback_template.format(fb=fb)
+                # Config uses {feedback_raw}, code fallback uses {fb}
+                try:
+                    feedback_section = feedback_template.format(feedback_raw=fb, fb=fb)
+                except (KeyError, IndexError):
+                    feedback_section = f"\n\n[Diagnostic Feedback]\n{fb}\n\n"
 
                 # Get original prompt text from non_tensor_batch
                 raw_prompt = [[""] * batch_size]
@@ -639,9 +749,15 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                     student_mask = batch.batch["attention_mask"][i]
                     teacher_input_ids_list.append(student_input.unsqueeze(0))
                     teacher_attention_mask_list.append(student_mask.unsqueeze(0))
-                    teacher_position_ids_list.append(
-                        compute_position_id_with_mask(student_mask.unsqueeze(0))
-                    )
+                    # Use student's position_ids if available (already 3D mrope)
+                    if "position_ids" in batch.batch and batch.batch["position_ids"].dim() == 3:
+                        teacher_position_ids_list.append(
+                            batch.batch["position_ids"][i].unsqueeze(0)
+                        )
+                    else:
+                        pos_1d = compute_position_id_with_mask(student_mask.unsqueeze(0))
+                        pos_3d = pos_1d.unsqueeze(1).expand(-1, 4, -1)
+                        teacher_position_ids_list.append(pos_3d)
                     self_distillation_mask_list.append(0.0)
                     continue
 
@@ -667,27 +783,33 @@ class IsoGraphRayPPOTrainer(RayPPOTrainer):
                     resp_valid_mask,
                 ], dim=0)
 
-                # Pad to student_seq_len for alignment
+                # LEFT-PAD to student_seq_len so that response stays at the END
+                # (dp_actor extracts log_probs from the last response_length positions)
                 teacher_input_len = teacher_input.shape[0]
                 if teacher_input_len < student_seq_len:
                     pad_len = student_seq_len - teacher_input_len
                     teacher_input = torch.cat([
+                        torch.full((pad_len,), pad_token_id, device=device, dtype=teacher_input.dtype),
                         teacher_input,
-                        torch.full((pad_len,), pad_token_id, device=device, dtype=teacher_input.dtype)
                     ])
                     teacher_mask = torch.cat([
+                        torch.zeros(pad_len, device=device, dtype=teacher_mask.dtype),
                         teacher_mask,
-                        torch.zeros(pad_len, device=device, dtype=teacher_mask.dtype)
                     ])
                 elif teacher_input_len > student_seq_len:
-                    teacher_input = teacher_input[:student_seq_len]
-                    teacher_mask = teacher_mask[:student_seq_len]
+                    # Truncate from the LEFT (keep response at end)
+                    excess = teacher_input_len - student_seq_len
+                    teacher_input = teacher_input[excess:]
+                    teacher_mask = teacher_mask[excess:]
 
                 teacher_input_ids_list.append(teacher_input.unsqueeze(0))
                 teacher_attention_mask_list.append(teacher_mask.unsqueeze(0))
-                teacher_position_ids_list.append(
-                    compute_position_id_with_mask(teacher_mask.unsqueeze(0))
-                )
+                # Create 3D mrope position_ids (bsz=1, 4, seqlen) for Qwen2.5-VL
+                # For text-only teacher input (no vision tokens), all 4 channels
+                # (text, temporal, height, width) are identical sequential positions.
+                pos_1d = compute_position_id_with_mask(teacher_mask.unsqueeze(0))  # (1, seqlen)
+                pos_3d = pos_1d.unsqueeze(1).expand(-1, 4, -1)  # (1, 4, seqlen)
+                teacher_position_ids_list.append(pos_3d)
                 self_distillation_mask_list.append(1.0)
 
             teacher_input_ids = torch.cat(teacher_input_ids_list, dim=0)

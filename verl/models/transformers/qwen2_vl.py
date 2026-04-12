@@ -21,6 +21,16 @@ from typing import Optional
 import torch
 import torch.distributed as dist
 from transformers.modeling_flash_attention_utils import _flash_attention_forward, fa_peft_integration_check
+
+# IMPORTANT: Force the transformers flash attention lazy loader to use FA2.
+# When flash_attn_3 is installed, transformers' lazy_import_flash_attention() caches FA3
+# functions globally on first call, and never re-imports FA2 even when explicitly requested.
+# This force_import call ensures FA2 is loaded and cached before any other code runs.
+try:
+    from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+    lazy_import_flash_attention("flash_attention_2", force_import=True)
+except (ImportError, TypeError):
+    pass
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLAttention,
     Qwen2VLCausalLMOutputWithPast,
@@ -245,18 +255,19 @@ def _custom_flash_attention_forward(
         )
         attn_output = attn_output.view(batch_size, -1, attn_output.size(-2), attn_output.size(-1))
     else:
-        attn_output = _flash_attention_forward(
+        # Directly call FA2's flash_attn_func to avoid transformers' lazy_import_flash_attention
+        # caching bug that returns FA3 functions even when FA2 is requested.
+        dropout_p = kwargs.pop("dropout", 0.0)
+        softmax_scale = kwargs.pop("softmax_scale", None)
+        attn_output = flash_attn_func(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            query_length,
-            is_causal=is_causal,
-            sliding_window=sliding_window,
-            use_top_left_mask=use_top_left_mask,
-            deterministic=deterministic,
-            **kwargs,
-        )  # do not pass position_ids to old flash_attention_forward
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=is_causal,
+            **flash_kwargs,
+        )
 
     if sp_size > 1:
         # (batch_size, seq_length, num_head, head_size)
@@ -275,6 +286,13 @@ def qwen2_vl_attn_forward(
 ) -> tuple[torch.Tensor, None, None]:
     from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb, repeat_kv
 
+    # Extract KV cache kwargs that the decoder layer passes through
+    past_key_values = kwargs.pop("past_key_values", None) or kwargs.pop("past_key_value", None)
+    use_cache = kwargs.pop("use_cache", False)
+    cache_position = kwargs.pop("cache_position", None)
+    # Discard other kwargs the original forward accepts but we don't need
+    kwargs.pop("output_attentions", None)
+
     bsz, q_len, _ = hidden_states.size()  # q_len = seq_length / sp_size
     query_states = self.q_proj(hidden_states)  # (batch_size, seq_length / sp_size, num_heads * head_size)
     key_states = self.k_proj(hidden_states)
@@ -289,6 +307,12 @@ def qwen2_vl_attn_forward(
     query_states, key_states = apply_multimodal_rotary_pos_emb(
         query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
     )
+
+    # Handle KV cache for generation (use_cache=True during model.generate())
+    if past_key_values is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
     dropout_rate = 0.0 if not self.training else self.attention_dropout
@@ -476,6 +500,7 @@ def forward_with_normal_backend(
 
     return Qwen2VLCausalLMOutputWithPast(
         logits=logits,
+        past_key_values=getattr(outputs, "past_key_values", None),
         hidden_states=outputs.hidden_states,
     )
 

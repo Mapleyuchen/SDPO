@@ -48,7 +48,18 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.torch_functional import get_response_mask
+from verl.utils.transformers_compat import is_transformers_version_in_range
 from verl.workers.config import HFModelConfig
+
+try:
+    from transformers import AutoProcessor
+except ImportError:
+    AutoProcessor = None
+
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:
+    process_vision_info = None
 
 from .base import BaseRollout
 from .isograph_env import create_environment, get_environment_class
@@ -164,6 +175,28 @@ class IsoGraphRollout(BaseRollout):
         self.module = module
         self.tokenizer = tokenizer
 
+        # ---- Initialize multimodal processor for VLMs ----
+        self.processor = None
+        model_path = None
+        # Try various config locations for model path
+        if hasattr(config, "model") and hasattr(config.model, "path"):
+            model_path = config.model.path
+        elif model_config is not None and hasattr(model_config, "path"):
+            model_path = model_config.path
+        # Fallback: use tokenizer's name_or_path (always available for HF tokenizers)
+        if not model_path and tokenizer is not None:
+            model_path = getattr(tokenizer, "name_or_path", None)
+
+        if model_path and AutoProcessor is not None:
+            try:
+                self.processor = AutoProcessor.from_pretrained(model_path)
+                print(f"[IsoGraphRollout] Loaded multimodal processor from {model_path}")
+            except Exception as e:
+                print(f"[IsoGraphRollout] Warning: Could not load processor from {model_path}: {e}")
+                self.processor = None
+        else:
+            print(f"[IsoGraphRollout] No processor loaded. model_path={model_path}, AutoProcessor={AutoProcessor is not None}")
+
         # Determine whether to use DummyEnvironment or Member C's IsoGraphEnvironment
         if environment is not None:
             self.environment = environment
@@ -218,21 +251,47 @@ class IsoGraphRollout(BaseRollout):
         """
         has_input_ids = prompts.batch is not None and "input_ids" in prompts.batch.keys()
 
+        if not hasattr(self, "_gen_debug_printed"):
+            self._gen_debug_printed = True
+            batch_keys = list(prompts.batch.keys()) if prompts.batch is not None else []
+            ntb_keys = list(prompts.non_tensor_batch.keys()) if hasattr(prompts, "non_tensor_batch") and prompts.non_tensor_batch else []
+            print(f"[IsoGraphRollout] generate_sequences: has_input_ids={has_input_ids}, "
+                  f"batch_keys={batch_keys}, ntb_keys={ntb_keys}, processor={self.processor is not None}")
+
         if not has_input_ids:
             prompts = self._tokenize_raw_prompts(prompts)
 
-        batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
-        output = [self._generate_minibatch(p) for p in batch_prompts]
-        output = DataProto.concat(output)
+        # When multimodal inputs are present, process as single batch
+        # (pixel_values are not batch-splittable)
+        has_multimodal = (
+            hasattr(self, "_pending_pixel_values") and self._pending_pixel_values is not None
+        )
+
+        if has_multimodal:
+            output = self._generate_minibatch(prompts)
+        else:
+            batch_size = prompts.batch.batch_size[0]
+            num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
+            batch_prompts = prompts.chunk(chunks=num_chunks)
+            output = [self._generate_minibatch(p) for p in batch_prompts]
+            output = DataProto.concat(output)
+
+        # Clear pending multimodal inputs after generation
+        self._pending_pixel_values = None
+        self._pending_image_grid_thw = None
+
         return output
 
     def _tokenize_raw_prompts(self, prompts: DataProto) -> DataProto:
         """Tokenize raw_prompt messages into input_ids / attention_mask / position_ids.
 
-        For VLMs like Qwen2.5-VL that use 3D mrope position_ids, constructs
-        the correct (3, batch_size, seq_len) tensor.
+        For VLMs like Qwen2.5-VL:
+          - Extracts images via ``qwen_vl_utils.process_vision_info``
+          - Uses the multimodal **processor** (not tokenizer) to produce
+            ``pixel_values`` and ``image_grid_thw``
+          - Constructs correct 3D mrope position_ids (batch, 4, seq_len)
+
+        Falls back to text-only tokenization when no processor is available.
         """
         raw_prompts = prompts.non_tensor_batch.get("raw_prompt", None)
         if raw_prompts is None:
@@ -241,9 +300,122 @@ class IsoGraphRollout(BaseRollout):
                 "Ensure the dataset provides at least one of these fields."
             )
 
+        max_len = self.config.get("prompt_length", 4096)
+        device = next(self.module.parameters()).device
+
+        # ---- Try multimodal path ----
+        if self.processor is not None and process_vision_info is not None:
+            return self._tokenize_multimodal(raw_prompts, max_len, device, prompts)
+
+        # ---- Fallback: text-only tokenization ----
+        return self._tokenize_text_only(raw_prompts, max_len, device, prompts)
+
+    def _tokenize_multimodal(
+        self, raw_prompts, max_len: int, device: torch.device, prompts: DataProto
+    ) -> DataProto:
+        """Tokenize with images using the multimodal processor."""
         all_input_ids = []
         all_attention_masks = []
-        max_len = self.config.get("prompt_length", 4096)
+        all_pixel_values = []
+        all_image_grid_thws = []
+        has_images = False
+
+        for raw in raw_prompts:
+            messages = raw if isinstance(raw, list) else json.loads(raw)
+
+            # Extract images from messages (handles file paths, URLs, base64)
+            try:
+                images, _videos = process_vision_info(messages)
+            except Exception as e:
+                print(f"[IsoGraphRollout] Warning: process_vision_info failed: {e}")
+                images = None
+
+            # Apply chat template via processor
+            text = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+            # Process with processor to get pixel_values + input_ids
+            proc_kwargs = dict(
+                text=[text],
+                return_tensors="pt",
+                max_length=max_len,
+                truncation=True,
+                padding=False,
+            )
+            if images:
+                proc_kwargs["images"] = images
+                has_images = True
+
+            encoded = self.processor(**proc_kwargs)
+
+            all_input_ids.append(encoded["input_ids"].squeeze(0))
+            all_attention_masks.append(encoded["attention_mask"].squeeze(0))
+
+            if "pixel_values" in encoded:
+                all_pixel_values.append(encoded["pixel_values"])
+            if "image_grid_thw" in encoded:
+                all_image_grid_thws.append(encoded["image_grid_thw"])
+
+        # ---- Pad input_ids / attention_mask ----
+        max_prompt_len = max(ids.size(0) for ids in all_input_ids)
+        pad_token_id = self.tokenizer.pad_token_id or 0
+
+        padded_ids, padded_masks = [], []
+        for ids, mask in zip(all_input_ids, all_attention_masks):
+            pad_len = max_prompt_len - ids.size(0)
+            if pad_len > 0:
+                ids = torch.cat([torch.full((pad_len,), pad_token_id, dtype=ids.dtype), ids])
+                mask = torch.cat([torch.zeros(pad_len, dtype=mask.dtype), mask])
+            padded_ids.append(ids)
+            padded_masks.append(mask)
+
+        batch_ids = torch.stack(padded_ids).to(device)
+        batch_masks = torch.stack(padded_masks).to(device)
+
+        # ---- Position IDs (mrope 3D for VLMs) ----
+        pos_1d = batch_masks.long().cumsum(-1) - 1
+        pos_1d.masked_fill_(batch_masks == 0, 0)
+
+        model_type = getattr(self.module.config, "model_type", "")
+        self._is_vlm_mrope = model_type in ("qwen2_vl", "qwen2_5_vl", "qwen3_vl", "qwen3_vl_moe")
+        if self._is_vlm_mrope:
+            position_ids = pos_1d.unsqueeze(1).expand(-1, 4, -1).contiguous()
+        else:
+            position_ids = pos_1d
+
+        td_dict = {
+            "input_ids": batch_ids,
+            "attention_mask": batch_masks,
+            "position_ids": position_ids,
+        }
+
+        # ---- Store multimodal inputs ----
+        # Store as instance variable since pixel_values can't go into non_tensor_batch
+        # (it's a variable-length tensor, not batch-aligned)
+        self._pending_pixel_values = None
+        self._pending_image_grid_thw = None
+
+        if has_images and all_pixel_values:
+            self._pending_pixel_values = torch.cat(all_pixel_values, dim=0).to(device)
+            if all_image_grid_thws:
+                self._pending_image_grid_thw = torch.cat(all_image_grid_thws, dim=0).to(device)
+            print(f"[IsoGraphRollout] Loaded {len(all_pixel_values)} images, "
+                  f"pixel_values shape: {self._pending_pixel_values.shape}")
+
+        new_batch = TensorDict(td_dict, batch_size=batch_ids.size(0))
+        return DataProto(
+            batch=new_batch,
+            non_tensor_batch=prompts.non_tensor_batch if prompts.non_tensor_batch else {},
+            meta_info=prompts.meta_info,
+        )
+
+    def _tokenize_text_only(
+        self, raw_prompts, max_len: int, device: torch.device, prompts: DataProto
+    ) -> DataProto:
+        """Fallback text-only tokenization (no images)."""
+        all_input_ids = []
+        all_attention_masks = []
 
         for raw in raw_prompts:
             messages = raw if isinstance(raw, list) else json.loads(raw)
@@ -266,7 +438,6 @@ class IsoGraphRollout(BaseRollout):
             padded_ids.append(ids)
             padded_masks.append(mask)
 
-        device = next(self.module.parameters()).device
         batch_ids = torch.stack(padded_ids).to(device)
         batch_masks = torch.stack(padded_masks).to(device)
 
@@ -344,11 +515,41 @@ class IsoGraphRollout(BaseRollout):
             return_dict_in_generate=True,
             use_cache=True,
         )
-        if has_position_ids:
-            gen_kwargs["position_ids"] = position_ids
+
+        # ---- Pass multimodal inputs (pixel_values, image_grid_thw) ----
+        if hasattr(self, "_pending_pixel_values") and self._pending_pixel_values is not None:
+            gen_kwargs["pixel_values"] = self._pending_pixel_values
+        if hasattr(self, "_pending_image_grid_thw") and self._pending_image_grid_thw is not None:
+            gen_kwargs["image_grid_thw"] = self._pending_image_grid_thw
+        # NOTE: Don't pass position_ids to generate() for Qwen2.5-VL.
+        # The model's prepare_inputs_for_generation computes correct 4D mrope position_ids
+        # internally. Passing verl's 3D position_ids causes cache corruption during generation.
+        # if has_position_ids:
+        #     gen_kwargs["position_ids"] = position_ids
 
         with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-            output = self.module.generate(**gen_kwargs)
+            # Temporarily restore ALL original forward methods for generation.
+            # The verl monkey-patches (model, base model, attention) don't support KV cache.
+            import verl.models.transformers.monkey_patch as _mp
+            _originals = _mp._unpatch_for_generation(self.module)
+            # Also unpatch _flash_attention_forward in flash_attention module
+            _fa_orig = None
+            try:
+                from transformers.integrations import flash_attention as _fa_mod
+                if hasattr(_fa_mod, '_flash_attention_forward'):
+                    from transformers.modeling_flash_attention_utils import _flash_attention_forward as _real_fa_fwd
+                    _fa_patched = _fa_mod._flash_attention_forward
+                    if _fa_patched is not _real_fa_fwd:
+                        _fa_orig = _fa_patched
+                        _fa_mod._flash_attention_forward = _real_fa_fwd
+            except ImportError:
+                pass
+            try:
+                output = self.module.generate(**gen_kwargs)
+            finally:
+                _mp._repatch_after_generation(self.module, _originals)
+                if _fa_orig is not None:
+                    _fa_mod._flash_attention_forward = _fa_orig
 
         seq = output.sequences
         generated_batch_size = seq.size(0)

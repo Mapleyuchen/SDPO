@@ -373,6 +373,11 @@ def apply_monkey_patch(
 
         from verl.models.transformers.qwen2_vl import forward_with_normal_backend, qwen2_vl_base_forward
 
+        # Save originals before patching (for generation unpatch/repatch)
+        if "Qwen2_5_VLForConditionalGeneration.forward.orig" not in _original_forwards:
+            _original_forwards["Qwen2_5_VLForConditionalGeneration.forward.orig"] = Qwen2_5_VLForConditionalGeneration.forward
+            _original_forwards["Qwen2_5_VLModel.forward.orig"] = Qwen2_5_VLModel.forward
+
         Qwen2_5_VLModel.forward = qwen2_vl_base_forward
         Qwen2VLModel.forward = qwen2_vl_base_forward
         Qwen2_5_VLForConditionalGeneration.forward = forward_with_normal_backend
@@ -393,6 +398,10 @@ def apply_monkey_patch(
 
         if use_remove_padding or ulysses_sp_size > 1:
             from verl.models.transformers.qwen2_vl import qwen2_vl_attn_forward
+
+            # Save original attention forward before patching
+            if "Qwen2_5_VLAttention.forward.orig" not in _original_forwards:
+                _original_forwards["Qwen2_5_VLAttention.forward.orig"] = Qwen2_5_VLAttention.forward
 
             Qwen2_5_VLAttention.forward = qwen2_vl_attn_forward
             Qwen2VLAttention.forward = qwen2_vl_attn_forward
@@ -491,3 +500,75 @@ def apply_monkey_patch(
             print(f"Monkey patch _flash_attention_forward in {flash_attention.__name__}")
 
     patch_forward_with_backends(model, use_fused_kernels=use_fused_kernels, fused_kernels_backend=fused_kernels_backend)
+
+
+# ---- Generation unpatch/repatch helpers ----
+# The verl monkey-patched forwards (qwen2_vl_base_forward, forward_with_normal_backend,
+# qwen2_vl_attn_forward) don't properly support KV cache / position_embeddings during
+# autoregressive generation. These helpers temporarily restore original forwards.
+
+# Store originals when first patched
+_original_forwards: dict = {}
+
+
+def _unpatch_for_generation(model) -> dict:
+    """Temporarily restore original forward methods for generation.
+    Returns a dict of {class: patched_forward} to restore later.
+    """
+    saved = {}
+    model_type = getattr(model, "config", None) and model.config.model_type
+
+    if model_type in ("qwen2_vl", "qwen2_5_vl"):
+        try:
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+                Qwen2_5_VLForConditionalGeneration,
+                Qwen2_5_VLModel,
+            )
+            if is_transformers_version_in_range(min_version="4.54.0"):
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLAttention
+            else:
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+                    Qwen2_5_VLFlashAttention2 as Qwen2_5_VLAttention,
+                )
+
+            # Save current patched methods
+            saved["Qwen2_5_VLForConditionalGeneration.forward"] = Qwen2_5_VLForConditionalGeneration.forward
+            saved["Qwen2_5_VLModel.forward"] = Qwen2_5_VLModel.forward
+            saved["Qwen2_5_VLAttention.forward"] = Qwen2_5_VLAttention.forward
+
+            # Restore originals from the class's __wrapped__ or from the stored originals
+            if "Qwen2_5_VLForConditionalGeneration.forward.orig" in _original_forwards:
+                Qwen2_5_VLForConditionalGeneration.forward = _original_forwards["Qwen2_5_VLForConditionalGeneration.forward.orig"]
+                Qwen2_5_VLModel.forward = _original_forwards["Qwen2_5_VLModel.forward.orig"]
+                Qwen2_5_VLAttention.forward = _original_forwards["Qwen2_5_VLAttention.forward.orig"]
+        except ImportError:
+            pass
+
+    return saved
+
+
+def _repatch_after_generation(model, saved: dict):
+    """Restore monkey-patched forward methods after generation."""
+    model_type = getattr(model, "config", None) and model.config.model_type
+
+    if model_type in ("qwen2_vl", "qwen2_5_vl"):
+        try:
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+                Qwen2_5_VLForConditionalGeneration,
+                Qwen2_5_VLModel,
+            )
+            if is_transformers_version_in_range(min_version="4.54.0"):
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLAttention
+            else:
+                from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+                    Qwen2_5_VLFlashAttention2 as Qwen2_5_VLAttention,
+                )
+
+            if "Qwen2_5_VLForConditionalGeneration.forward" in saved:
+                Qwen2_5_VLForConditionalGeneration.forward = saved["Qwen2_5_VLForConditionalGeneration.forward"]
+            if "Qwen2_5_VLModel.forward" in saved:
+                Qwen2_5_VLModel.forward = saved["Qwen2_5_VLModel.forward"]
+            if "Qwen2_5_VLAttention.forward" in saved:
+                Qwen2_5_VLAttention.forward = saved["Qwen2_5_VLAttention.forward"]
+        except ImportError:
+            pass

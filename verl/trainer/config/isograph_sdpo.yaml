@@ -136,6 +136,14 @@ actor_rollout_ref:
     # --------------------------------------------------------------------------
     self_distillation:
 
+      # EMA teacher configuration
+      teacher_regularization: ema     # "ema" or "trust-region"
+      teacher_update_rate: 0.05       # EMA: θ_teacher ← (1-rate)·θ_teacher + rate·θ_student
+      alpha: 0.5
+      full_logit_distillation: true
+      distillation_topk: 100
+      distillation_add_tail: true
+
       max_reprompt_len: 4096
       is_clip: 2.0
       dont_reprompt_on_self_success: true

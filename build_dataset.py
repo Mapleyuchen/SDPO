@@ -42,8 +42,9 @@ for filename in sorted(os.listdir(DATA_B_DIR)):
         ]
         
         row = {
-            "prompt": json.dumps(prompt_msgs),  # verl 需要 stringified JSON
-            "image_id": real_image_id,          # 传递给 Member C 环境的 ID
+            "data_source": "isograph",             # 用于 reward_manager 路由
+            "prompt": json.dumps(prompt_msgs),      # verl 需要 stringified JSON
+            "image_id": real_image_id,              # 传递给 Member C 环境的 ID
             "reward_model": {
                 "style": "rule",
                 "ground_truth": json.dumps(graph_data),

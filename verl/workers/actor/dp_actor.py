@@ -17,6 +17,7 @@
 Single Process Actor
 """
 
+import contextlib
 import logging
 import os
 from types import SimpleNamespace
@@ -138,7 +139,7 @@ class DataParallelPPOActor(BasePPOActor):
     def _update_teacher(self) -> None:
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-        if not self_distillation_cfg or loss_mode != "sdpo":
+        if not self_distillation_cfg or loss_mode not in ("sdpo", "isograph"):
             return
         teacher_regularization = getattr(self_distillation_cfg, "teacher_regularization", "ema")
         if teacher_regularization != "ema":
@@ -148,13 +149,40 @@ class DataParallelPPOActor(BasePPOActor):
             return
         if self.teacher_module is None or self.teacher_module is self.actor_module:
             raise ValueError("EMA teacher requires a separate teacher_module in the actor worker.")
+
+        try:
+            from torch.distributed._tensor import DTensor
+        except ImportError:
+            DTensor = None
+
+        # For FSDP2, operate via state_dict to avoid DTensor dispatch issues.
+        # state_dict() returns plain tensors (full or sharded depending on
+        # FSDP StateDictType), and load_state_dict() handles the conversion back.
+        if DTensor is not None:
+            try:
+                t_sd = self.teacher_module.state_dict()
+                s_sd = self.actor_module.state_dict()
+                with torch.no_grad():
+                    for key in t_sd:
+                        if key in s_sd:
+                            t_sd[key] = torch.lerp(t_sd[key], s_sd[key], update_rate)
+                self.teacher_module.load_state_dict(t_sd, strict=False)
+                return
+            except Exception as e:
+                logger.warning(
+                    f"EMA teacher update via state_dict failed ({e}), "
+                    "falling back to parameter-level update. "
+                    "This fallback will fail under FSDP2 with DTensor parameters."
+                )
+                # Fall through to parameter-level update
+
         with torch.no_grad():
             for teacher_param, student_param in zip(
                 self.teacher_module.parameters(),
                 self.actor_module.parameters(),
             ):
-                student_data = student_param.data.to(device=teacher_param.device)
-                teacher_param.data.mul_(1.0 - update_rate).add_(student_data, alpha=update_rate)
+                s_data = student_param.data.to(device=teacher_param.device)
+                teacher_param.data.mul_(1.0 - update_rate).add_(s_data, alpha=update_rate)
 
     @staticmethod
     def _has_non_empty_multi_modal_inputs(multi_modal_inputs) -> bool:
